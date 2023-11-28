@@ -23,6 +23,8 @@ using tcp = boost::asio::ip::tcp;
 #include <thread>
 #include <vector>
 #include <set>
+#include <map>
+#include <list>
 #include <memory>
 #include <charconv>
 
@@ -37,23 +39,73 @@ std::uint32_t calcHeavyHash(const std::string_view str)
 }
 
 struct hasher {
+    struct queue_item {
+        std::string str;
+        std::string hash;
+        std::function<void(std::string)> cb;
+    };
+    // `list` is used here because I need an iterator to an inserted element
+    using queue_type = std::list<queue_item>;
+    using queue_iterator = queue_type::iterator;
+
     hasher(ba::io_context &ioc)
-        :m_strand{ioc}
+        :m_ioc{ioc}
+        ,m_strand{ioc}
     {}
 
-    // F's signature: void(std::string hash)
-    template<typename F>
-    void hash(const std::string_view str, F f) {
-        auto hash_int = calcHeavyHash(str);
-        char hash_buf[16]{};
-        auto [end_ptr, ec] = std::to_chars(std::begin(hash_buf), std::end(hash_buf), hash_int, 16);
-        if ( ec == std::errc{} ) {
-            f(std::string{std::begin(hash_buf), end_ptr});
+    // CB's signature: void(std::string hash)
+    template<typename CB>
+    void hash(std::string str, CB cb) {
+        ba::post(
+             m_strand
+            ,[this, str=std::move(str), cb=std::move(cb)]
+             () mutable
+            { hash_impl(std::move(str), std::move(cb)); }
+        );
+    }
+
+private:
+    template<typename CB>
+    void hash_impl(std::string str, CB cb) {
+        auto it = m_queue.insert(
+             m_queue.begin()
+            ,{std::move(str), std::string{}, std::move(cb)}
+        );
+
+        // post to io_context execution pool
+        ba::post(
+             m_ioc
+            ,[this, it]() {
+                auto hash_int = calcHeavyHash(it->str);
+                char hash_buf[16]{};
+                auto [end_ptr, ec] = std::to_chars(hash_buf, std::end(hash_buf), hash_int, 16);
+                std::string hash{"0x"};
+                hash.append(hash_buf, end_ptr);
+                it->hash = std::move(hash);
+
+                // when finished - post back to our strand
+                ba::post(
+                     m_strand
+                    ,[this, it]()
+                    { on_hashed(it); }
+                );
+            }
+        );
+    }
+    // called from our strand
+    void on_hashed(queue_iterator it) {
+        if ( it == m_queue.begin() ) {
+            while ( it != m_queue.end() && !it->hash.empty() ) {
+                it->cb(std::move(it->hash));
+                it = m_queue.erase(it);
+            }
         }
     }
 
 private:
+    ba::io_context &m_ioc;
     ba::io_context::strand m_strand;
+    queue_type m_queue;
 };
 
 /**********************************************************************************************************************/
@@ -64,85 +116,87 @@ struct shared_state {
         ,m_hasher{ioc}
     {}
 
-    // F's signature: void(bool updated, std::string_view key, std::string_view hash)
-    template<typename F>
-    void update(std::shared_ptr<std::string> msg, F f) {
-        auto pos = msg->find(' ');
-        if ( pos == std::string::npos ) {
-            std::cerr << "wrong string received!" << std::endl;
-
-            f(false, std::string_view{}, std::string_view{});
-
-            return;
-        }
-
-        // since we performed the search here, we create the key and
-        // value here so as not to search again.
-        std::string_view key{msg->data(), pos};
-        std::string_view val{msg->data() + pos + 1, msg->size() - pos - 1};
-
+    // CB's signature: void(bool updated, const std::string &key, const std::string &hash)
+    template<typename CB>
+    void update(std::string key, std::string val, CB cb) {
         ba::post(
              m_strand
-            ,[this, msg=std::move(msg), key, val, f=std::move(f)]()
-             { calculate_hash(std::move(msg), key, val, std::move(f)); }
+            ,[this, key=std::move(key), val=std::move(val), cb=std::move(cb)]
+             () mutable
+            { calculate_hash(std::move(key), std::move(val), std::move(cb)); }
         );
     }
 
 private:
-    template<typename F>
-    void calculate_hash(std::shared_ptr<std::string> msg, std::string_view key, std::string_view val, F f) {
+    template<typename CB>
+    void calculate_hash(std::string key, std::string val, CB cb) {
+        std::cout << "calculate_hash: key=" << key << ", val=" << val << std::endl;
+
         m_hasher.hash(
-            val
-            ,[this, msg=std::move(msg), key, f=std::move(f)]
-            (std::string hash) {
+             std::move(val)
+            ,[this, key=std::move(key), cb=std::move(cb)]
+             (std::string hash) mutable {
                 // back to the our strand
                 ba::post(
                      m_strand
-                    ,[this, msg=std::move(msg), hash=std::move(hash), key, f=std::move(f)]
-                     ()
-                     { hash_calculated(key, std::move(hash), std::move(f)); }
+                    ,[this, hash=std::move(hash), key=std::move(key), cb=std::move(cb)]
+                     () mutable
+                     { hash_calculated(std::move(key), std::move(hash), std::move(cb)); }
                 );
             }
         );
     }
-    template<typename F>
-    void hash_calculated(std::string_view key, std::string hash, F f) {
+    template<typename CB>
+    void hash_calculated(std::string key, std::string hash, CB cb) {
+        std::cout << "hash_calculated: key=" << key << ", hash=" << hash << std::endl;
+
         // check for key
         auto it = m_map.find(key);
         if ( it == m_map.end() ) {
-            auto inserted = m_map.emplace(key, std::move(hash));
-            f(true, key, inserted.first->second);
+            auto inserted = m_map.emplace(std::move(key), std::move(hash));
+            cb(true, inserted.first->first, inserted.first->second);
 
             return;
         }
 
         // check for val
         if ( it->second != hash ) {
-            f(true, key, it->second);
+            it->second = std::move(hash);
+
+            cb(true, it->first, it->second);
 
             return;
         }
 
-        f(false, std::string_view{}, std::string_view{});
+        cb(false, empty_string, empty_string);
     }
 
 private:
     ba::io_context::strand m_strand;
     std::map<std::string, std::string, std::less<>> m_map;
     hasher m_hasher;
+    static const std::string empty_string;
 };
+
+const std::string shared_state::empty_string;
 
 /**********************************************************************************************************************/
 
+struct session_manager;
+
 struct session: std::enable_shared_from_this<session> {
     using holder_ptr = std::shared_ptr<session>;
+    using broadcast_cb_type = std::function<void(std::shared_ptr<std::string> msg)>;
 
-    session(tcp::socket sock, shared_state &state)
+    session(tcp::socket sock, shared_state &state, broadcast_cb_type broadcast)
         :m_sock{std::move(sock)}
         ,m_buf{}
         ,m_ready_write{true}
         ,m_state{state}
-    {}
+        ,m_broadcast{std::move(broadcast)}
+    {
+        m_peer = m_sock.remote_endpoint();
+    }
 
     void start(holder_ptr holder) {
         ba::async_read_until(
@@ -150,27 +204,47 @@ struct session: std::enable_shared_from_this<session> {
             ,m_buf
             ,'\n'
             ,[this, holder=std::move(holder)]
-             (const bs::error_code& ec, std::size_t size) {
-                readed(ec, size, std::move(holder));
-            }
+             (const bs::error_code& ec, std::size_t size) mutable
+             {readed(ec, size, std::move(holder)); }
         );
     }
     void readed(const bs::error_code& ec, std::size_t, holder_ptr holder) {
         if ( ec ) {
-            std::cerr << "read error: " << ec << std::endl;
+            if ( ec == ba::error::eof ) {
+                std::cerr
+                    << "the client("
+                    << m_peer.address().to_string() << ":" << m_peer.port()
+                    << ") disconnected"
+                    << std::endl;
+            } else {
+                std::cerr << "read error: " << ec << std::endl;
+            }
 
             return;
         }
 
         std::istream is(&m_buf);
-        auto str = std::make_shared<std::string>();
-        std::getline(is, *str);
+        std::string str;
+        std::getline(is, str);
+
+        auto pos = str.find(' ');
+        if ( pos == std::string::npos ) {
+            std::cerr << "wrong string received: \"" << str << "\"" << std::endl;
+
+            start(std::move(holder));
+
+            return;
+        }
+
+        std::string key{str.data(), pos};
+        std::string val{str.data() + pos + 1, str.size() - pos - 1};
 
         m_state.update(
-             str
+             std::move(key)
+            ,std::move(val)
             ,[this, holder=std::move(holder)]
-             (bool really, std::string_view key, std::string_view hash)
-            { updated(really, key, hash, std::move(holder)); }
+             (bool really, const std::string &key, const std::string &hash) mutable
+             { updated(really, key, hash, std::move(holder)); }
         );
     }
 
@@ -179,21 +253,32 @@ struct session: std::enable_shared_from_this<session> {
         ba::post(
              m_sock.get_executor()
             ,[this, msg=std::move(msg), holder=std::move(holder)]
-             ()
-            { send_impl(std::move(msg), std::move(holder)); }
+             () mutable
+             { send_impl(std::move(msg), std::move(holder)); }
         );
     }
 
 private:
-    void updated(bool really, std::string_view key, std::string_view hash, holder_ptr holder) {
+    // still called from state's strand
+    void updated(bool really, const std::string &key, const std::string &hash, holder_ptr holder) {
         std::cout << really << ":" << key << ":" << hash << std::endl;
+
+        if ( really ) {
+            auto msg = std::make_shared<std::string>();
+            *msg += key;
+            *msg += ' ';
+            *msg += hash;
+            *msg += '\n';
+
+            m_broadcast(std::move(msg));
+        }
 
         // back to the our strand
         ba::post(
              m_sock.get_executor()
             ,[this, holder=std::move(holder)]
-             ()
-            { start(std::move(holder)); }
+             () mutable
+             { start(std::move(holder)); }
         );
     }
 
@@ -205,9 +290,11 @@ private:
 
         m_ready_write = false;
 
+        const auto *ptr = msg->data();
+        const auto size = msg->size();
         ba::async_write(
              m_sock
-            ,ba::buffer(*msg)
+            ,ba::buffer(ptr, size)
             ,[this, msg=std::move(msg), holder=std::move(holder)]
              (const bs::error_code &ec, std::size_t)
              { sent(ec); }
@@ -215,6 +302,8 @@ private:
     }
     void sent(const bs::error_code &ec) {
         if ( ec ) {
+            std::cerr << "write error: " << ec << std::endl;
+
             m_sock.close();
 
             return;
@@ -225,9 +314,11 @@ private:
 
 private:
     tcp::socket m_sock;
+    tcp::endpoint m_peer;
     ba::streambuf m_buf;
     bool m_ready_write;
     shared_state &m_state;
+    broadcast_cb_type m_broadcast;
 };
 
 /**********************************************************************************************************************/
@@ -250,7 +341,7 @@ struct session_manager {
     void broadcast(std::shared_ptr<std::string> msg) {
         ba::post(
              m_strand
-            ,[this, msg](){
+            ,[this, msg=std::move(msg)](){
                 for ( auto it = m_set.begin(); it != m_set.end(); ) {
                     if ( auto sptr = it->lock(); sptr ) {
                         ++it;
@@ -295,12 +386,22 @@ struct acceptor {
 private:
     void on_accepted(const bs::error_code &ec, tcp::socket sock) {
         if ( ec ) {
-            std::cerr << "acceptor was stopped because of error: " << ec << std::endl;
+            std::cerr << "acceptor error: " << ec << std::endl;
 
             return;
         }
 
-        auto sptr = std::make_shared<session>(std::move(sock), m_state);
+        const auto rep = sock.remote_endpoint();
+        std::cout << "new connection from: " << rep.address().to_string() << ":" << rep.port() << std::endl;
+
+        auto sptr = std::make_shared<session>(
+             std::move(sock)
+            ,m_state
+            ,[this]
+             (std::shared_ptr<std::string> msg)
+             { m_smgr.broadcast(std::move(msg)); }
+        );
+
         sptr->start(sptr->shared_from_this());
 
         m_smgr.add(sptr);
@@ -330,8 +431,8 @@ int main(int argc, char **argv) try {
 
     ba::io_context ioctx{threads};
 
-    session_manager smgr{ioctx};
     shared_state state{ioctx};
+    session_manager smgr{ioctx};
     acceptor acc{ioctx, port, smgr, state};
     acc.start();
 
