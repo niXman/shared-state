@@ -1,2 +1,2 @@
 # shared-state
-Test task for Shared-State server service implementing using asio
+Test task for Shared-State server implementing using asio
