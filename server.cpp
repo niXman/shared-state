@@ -173,14 +173,14 @@ private:
             return;
         }
 
-        // just to avoid constructing the strings all the time
+        // just to avoid constructing the empty strings many times
         static const std::string empty_string;
         cb(false, empty_string, empty_string);
     }
 
 private:
     ba::io_context::strand m_strand;
-    std::map<std::string, std::string, std::less<>> m_map;
+    std::map<std::string, std::string> m_map;
     hasher m_hasher;
 };
 
