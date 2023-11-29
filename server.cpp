@@ -6,7 +6,7 @@
 //
 // This file is part of Shared-State(https://github.com/niXman/shared-state) project.
 //
-// This was a test task for implementing Shared-State server using asio.
+// This was a test task for implementing multithreaded Shared-State server using asio.
 //
 // Copyright (c) 2023 niXman (github dot nixman dog pm.me). All rights reserved.
 // ----------------------------------------------------------------------------
