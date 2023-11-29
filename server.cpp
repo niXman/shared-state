@@ -30,7 +30,7 @@ using tcp = boost::asio::ip::tcp;
 
 /**********************************************************************************************************************/
 
-std::uint32_t calcHeavyHash(const std::string_view str)
+std::uint32_t calcHeavyHash(const std::string &str)
 {
     // CRC32 is not heavy, but let's assume we're doing something really CPU-intensive here...
     boost::crc_32_type crc32;
@@ -78,7 +78,12 @@ private:
             ,[this, it]() {
                 auto hash_int = calcHeavyHash(it->str);
                 char hash_buf[16]{};
-                auto [end_ptr, ec] = std::to_chars(hash_buf, std::end(hash_buf), hash_int, 16);
+                auto [end_ptr, ec] = std::to_chars(
+                     hash_buf
+                    ,std::end(hash_buf)
+                    ,hash_int
+                    ,16
+                );
                 std::string hash{"0x"};
                 hash.append(hash_buf, end_ptr);
                 it->hash = std::move(hash);
@@ -123,7 +128,7 @@ struct shared_state {
              m_strand
             ,[this, key=std::move(key), val=std::move(val), cb=std::move(cb)]
              () mutable
-            { calculate_hash(std::move(key), std::move(val), std::move(cb)); }
+             { calculate_hash(std::move(key), std::move(val), std::move(cb)); }
         );
     }
 
@@ -168,6 +173,8 @@ private:
             return;
         }
 
+        // just to avoid constructing the strings all the time
+        static const std::string empty_string;
         cb(false, empty_string, empty_string);
     }
 
@@ -175,14 +182,9 @@ private:
     ba::io_context::strand m_strand;
     std::map<std::string, std::string, std::less<>> m_map;
     hasher m_hasher;
-    static const std::string empty_string;
 };
 
-const std::string shared_state::empty_string;
-
 /**********************************************************************************************************************/
-
-struct session_manager;
 
 struct session: std::enable_shared_from_this<session> {
     using holder_ptr = std::shared_ptr<session>;
