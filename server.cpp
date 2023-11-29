@@ -28,6 +28,12 @@ using tcp = boost::asio::ip::tcp;
 #include <memory>
 #include <charconv>
 
+#ifndef HIDE_DEBUG_OUTPUT
+#   define DEBUG_EXPR(...) __VA_ARGS__
+#else
+#   define DEBUG_EXPR(...)
+#endif
+
 /**********************************************************************************************************************/
 
 std::uint32_t calcHeavyHash(const std::string &str)
@@ -116,6 +122,10 @@ private:
 /**********************************************************************************************************************/
 
 struct shared_state {
+    using map_type = std::map<std::string, std::string>;
+    using map_iterator = map_type::iterator;
+    using map_const_iterator = map_type::const_iterator;
+
     shared_state(ba::io_context &ioc)
         :m_strand{ioc}
         ,m_hasher{ioc}
@@ -132,10 +142,72 @@ struct shared_state {
         );
     }
 
+    // CB's signature: void(std::size_t size)
+    template<typename CB>
+    void get_size(CB cb) {
+        ba::post(
+             m_strand
+            ,[this, cb=std::move(cb)]
+             () mutable
+             { get_size_impl(std::move(cb)); }
+        );
+    }
+
+    // CB's signature: void(bool empty, map_const_iterator it, const std::string &key, const std::string &hash)
+    template<typename CB>
+    void get_first(CB cb) {
+        ba::post(
+             m_strand
+            ,[this, cb=std::move(cb)]
+             () mutable
+             { get_first_impl(std::move(cb)); }
+        );
+    }
+    // CB's signature: void(bool at_end, map_const_iterator it, const std::string &key, const std::string &hash)
+    template<typename CB>
+    void get_next(map_const_iterator it, CB cb) {
+        ba::post(
+             m_strand
+            ,[this, it, cb=std::move(cb)]
+             () mutable
+             { get_next_impl(it, std::move(cb)); }
+        );
+    }
+
 private:
     template<typename CB>
+    void get_size_impl(CB cb) {
+        auto size = m_map.size();
+        cb(size);
+    }
+
+    template<typename CB>
+    void get_first_impl(CB cb) {
+        map_const_iterator it = m_map.begin();
+        if ( it != m_map.end() ) {
+            cb(false, it, it->first, it->second);
+        } else {
+            // just to avoid constructing the empty strings many times
+            static const std::string empty_string;
+            cb(true, it, empty_string, empty_string);
+        }
+    }
+
+    template<typename CB>
+    void get_next_impl(map_const_iterator it, CB cb) {
+        it = std::next(it);
+        if ( it != m_map.end() ) {
+            cb(false, it, it->first, it->second);
+        } else {
+            // just to avoid constructing the empty strings many times
+            static const std::string empty_string;
+            cb(true, it, empty_string, empty_string);
+        }
+    }
+
+    template<typename CB>
     void calculate_hash(std::string key, std::string val, CB cb) {
-        std::cout << "calculate_hash: key=" << key << ", val=" << val << std::endl;
+        DEBUG_EXPR(std::cout << "calculate_hash: key=" << key << ", val=" << val << std::endl;);
 
         m_hasher.hash(
              std::move(val)
@@ -153,7 +225,7 @@ private:
     }
     template<typename CB>
     void hash_calculated(std::string key, std::string hash, CB cb) {
-        std::cout << "hash_calculated: key=" << key << ", hash=" << hash << std::endl;
+        DEBUG_EXPR(std::cout << "hash_calculated: key=" << key << ", hash=" << hash << std::endl;);
 
         // check for key
         auto it = m_map.find(key);
@@ -175,12 +247,13 @@ private:
 
         // just to avoid constructing the empty strings many times
         static const std::string empty_string;
+        // no changes case
         cb(false, empty_string, empty_string);
     }
 
 private:
     ba::io_context::strand m_strand;
-    std::map<std::string, std::string> m_map;
+    map_type m_map;
     hasher m_hasher;
 };
 
@@ -192,22 +265,103 @@ struct session: std::enable_shared_from_this<session> {
 
     session(tcp::socket sock, shared_state &state, broadcast_cb_type broadcast)
         :m_sock{std::move(sock)}
+        ,m_peer{m_sock.remote_endpoint()}
         ,m_buf{}
-        ,m_ready_write{true}
         ,m_state{state}
+        ,m_state_it{}
         ,m_broadcast{std::move(broadcast)}
-    {
-        m_peer = m_sock.remote_endpoint();
-    }
+    {}
 
     void start(holder_ptr holder) {
+        start_read(std::move(holder));
+
+        // start to sync the state
+        m_state.get_first(
+            [this]
+            (bool empty, shared_state::map_const_iterator it, const std::string &key, const std::string &hash)
+            { on_got_message(empty, it, key, hash); }
+        );
+    }
+
+    // we have two overloads of `send()` function because in the case
+    // of broadcasting we can share one string for all clients
+    // without creating copies
+
+    // may be called from any thread
+    void send(std::shared_ptr<std::string> msg, std::function<void(const bs::error_code &)> cb = {}) {
+        auto holder = shared_from_this();
+        ba::post(
+             m_sock.get_executor()
+            ,[this, msg=std::move(msg), holder=std::move(holder), cb=std::move(cb)]
+             () mutable
+            { send_impl(std::move(msg), std::move(holder), std::move(cb)); }
+        );
+    }
+    void send(std::string msg, std::function<void(const bs::error_code &)> cb = {}) {
+        auto holder = shared_from_this();
+        ba::post(
+             m_sock.get_executor()
+            ,[this, msg=std::move(msg), holder=std::move(holder), cb=std::move(cb)]
+             () mutable
+             { send_impl(std::move(msg), std::move(holder), std::move(cb)); }
+        );
+    }
+
+private:
+    // called from shared_state's strand
+    void on_got_message(bool empty, shared_state::map_const_iterator it, const std::string &key, const std::string &hash) {
+        if ( !empty ) {
+            DEBUG_EXPR(std::cout << "on_got_message: empty == false" << std::endl;);
+
+            std::string msg = key;
+            msg += ' ';
+            msg += hash;
+            msg += '\n';
+
+            DEBUG_EXPR(std::cout << "on_got_message: msg=" << msg << std::endl;);
+
+            ba::post(
+                 m_sock.get_executor()
+                ,[this, it, msg=std::move(msg)]
+                 () mutable
+                 {
+                    m_state_it = it;
+                    send(
+                         std::move(msg)
+                        ,[this]
+                         (const bs::error_code &ec)
+                         { on_get_first_sent(ec); }
+                    );
+                 }
+            );
+        } else {
+            DEBUG_EXPR(std::cout << "on_got_message: empty == true" << std::endl;);
+        }
+    }
+    void on_get_first_sent(const bs::error_code &ec) {
+        if ( ec ) {
+            std::cerr << "on_get_first_sent error: " << ec << std::endl;
+
+            return;
+        }
+
+        m_state.get_next(
+             m_state_it
+            ,[this]
+             (bool at_end, shared_state::map_const_iterator it, const std::string &key, const std::string &hash)
+             { on_got_message(at_end, it, key, hash); }
+        );
+    }
+
+private:
+    void start_read(holder_ptr holder) {
         ba::async_read_until(
              m_sock
             ,m_buf
             ,'\n'
             ,[this, holder=std::move(holder)]
              (const bs::error_code& ec, std::size_t size) mutable
-             {readed(ec, size, std::move(holder)); }
+             { readed(ec, size, std::move(holder)); }
         );
     }
     void readed(const bs::error_code& ec, std::size_t, holder_ptr holder) {
@@ -233,7 +387,7 @@ struct session: std::enable_shared_from_this<session> {
         if ( pos == std::string::npos ) {
             std::cerr << "wrong string received: \"" << str << "\"" << std::endl;
 
-            start(std::move(holder));
+            start_read(std::move(holder));
 
             return;
         }
@@ -250,24 +404,17 @@ struct session: std::enable_shared_from_this<session> {
         );
     }
 
-    void send(std::shared_ptr<std::string> msg) {
-        auto holder = shared_from_this();
-        ba::post(
-             m_sock.get_executor()
-            ,[this, msg=std::move(msg), holder=std::move(holder)]
-             () mutable
-             { send_impl(std::move(msg), std::move(holder)); }
-        );
-    }
-
 private:
-    // still called from state's strand
+    // called from shared_state's strand
     void updated(bool really, const std::string &key, const std::string &hash, holder_ptr holder) {
-        std::cout << really << ":" << key << ":" << hash << std::endl;
+        DEBUG_EXPR(std::cout << "really?=" << really << ", key=" << key << ", hash=" << hash << std::endl;);
 
+        // when `really` == true, it's mean that `shared_state` was really updated
         if ( really ) {
+            // it is made shared to NOT to create copies of the string
+            // for all the sessions when broadcasting
             auto msg = std::make_shared<std::string>();
-            *msg += key;
+            *msg = key;
             *msg += ' ';
             *msg += hash;
             *msg += '\n';
@@ -280,29 +427,36 @@ private:
              m_sock.get_executor()
             ,[this, holder=std::move(holder)]
              () mutable
-             { start(std::move(holder)); }
+             { start_read(std::move(holder)); }
         );
     }
 
 private:
-    void send_impl(std::shared_ptr<std::string> msg, holder_ptr holder) {
-        if ( !m_ready_write ) {
-            return;
-        }
-
-        m_ready_write = false;
-
+    void send_impl(std::shared_ptr<std::string> msg, holder_ptr holder, std::function<void(const bs::error_code &)> cb) {
         const auto *ptr = msg->data();
         const auto size = msg->size();
         ba::async_write(
              m_sock
             ,ba::buffer(ptr, size)
-            ,[this, msg=std::move(msg), holder=std::move(holder)]
+            ,[this, msg=std::move(msg), holder=std::move(holder), cb=std::move(cb)]
              (const bs::error_code &ec, std::size_t)
-             { sent(ec); }
+            { sent(ec, std::move(cb)); }
         );
     }
-    void sent(const bs::error_code &ec) {
+    void send_impl(std::string msg, holder_ptr holder, std::function<void(const bs::error_code &)> cb) {
+        const auto *ptr = msg.data();
+        const auto size = msg.size();
+        std::cout << "send_impl(string): "; std::cout.write(ptr, size); std::cout << std::endl;
+
+        ba::async_write(
+             m_sock
+            ,ba::buffer(ptr, size)
+            ,[this, msg=std::move(msg), holder=std::move(holder), cb=std::move(cb)]
+             (const bs::error_code &ec, std::size_t)
+            { sent(ec, std::move(cb)); }
+        );
+    }
+    void sent(const bs::error_code &ec, std::function<void(const bs::error_code &)> cb) {
         if ( ec ) {
             std::cerr << "write error: " << ec << std::endl;
 
@@ -311,15 +465,17 @@ private:
             return;
         }
 
-        m_ready_write = true;
+        if ( cb ) {
+            cb(ec);
+        }
     }
 
 private:
     tcp::socket m_sock;
     tcp::endpoint m_peer;
     ba::streambuf m_buf;
-    bool m_ready_write;
     shared_state &m_state;
+    shared_state::map_const_iterator m_state_it;
     broadcast_cb_type m_broadcast;
 };
 
@@ -334,9 +490,9 @@ struct session_manager {
     void add(std::weak_ptr<session> sptr) {
         ba::post(
              m_strand
-            ,[this, sptr](){
-                m_set.insert(sptr);
-            }
+            ,[this, sptr]
+             ()
+             { m_set.insert(sptr); }
         );
     }
 
@@ -394,7 +550,7 @@ private:
         }
 
         const auto rep = sock.remote_endpoint();
-        std::cout << "new connection from: " << rep.address().to_string() << ":" << rep.port() << std::endl;
+        DEBUG_EXPR(std::cout << "new connection from: " << rep.address().to_string() << ":" << rep.port() << std::endl;);
 
         auto sptr = std::make_shared<session>(
              std::move(sock)
