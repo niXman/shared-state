@@ -3,6 +3,7 @@ Test task for implementing multithreaded Shared-State server using asio
 
 # Update Nov 30, 2023
 The company refused me because of bugs... It's OK, bugs can be everywhere, because programmers are people too =)
+
 I'm curious and trying to understand what these bugs are...
 
 Another surprising thing:
