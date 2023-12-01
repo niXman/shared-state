@@ -1,0 +1,1 @@
+N=100; idx=0; pwgen -1 16 $N | while read LINE; do echo "key-$idx val-$LINE"; let "idx++"; done > $N.txt

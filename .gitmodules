@@ -1,0 +1,3 @@
+[submodule "cmdargs"]
+	path = cmdargs
+	url = https://github.com/niXman/cmdargs.git
