@@ -13,3 +13,7 @@ Another surprising thing:
 - Or did the company need someone to implement this task for free?
 
 This all looks very strange...
+
+# Update Dec 1, 2023
+Guys, please stop writing me tons of emails and questions, I don’t want to spend all day answering!
+I'll add more information in the README.
