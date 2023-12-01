@@ -1,4 +1,4 @@
-# shared-state
+# shared-state-server
 Test task for implementing multithreaded Shared-State server using asio
 
 # Update Nov 30, 2023
