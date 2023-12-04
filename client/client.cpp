@@ -21,6 +21,16 @@ using tcp = boost::asio::ip::tcp;
 
 #include <iostream>
 
+using shared_buffer = std::shared_ptr<std::string>;
+
+shared_buffer make_buffer(std::string str = {}) {
+    return std::make_shared<shared_buffer::element_type>(std::move(str));
+}
+
+shared_buffer make_buffer(const char *beg, const char *end) {
+    return make_buffer(std::string{beg, end});
+}
+
 /**********************************************************************************************************************/
 
 struct client {
@@ -50,7 +60,8 @@ struct client {
         }
     }
 
-    void send(std::string str) {
+    void send(shared_buffer str) {
+        //std::cout << "send: " << str << ", addr=" << (const void *)str.data() << std::endl;
         ba::post(
              m_socket.get_executor()
             ,[this, str=std::move(str)]
@@ -77,45 +88,48 @@ private:
             return;
         }
 
-        start_read();
+        auto buf = make_buffer();
+        start_read(std::move(buf));
     }
-    void start_read() {
+    void start_read(shared_buffer buf) {
+        auto *ptr = buf.get();
         ba::async_read_until(
              m_socket
-            ,ba::dynamic_buffer(m_buf)
+            ,ba::dynamic_buffer(*ptr)
             ,'\n'
-            ,[this]
-             (const bs::error_code &ec, std::size_t rd)
-             { on_readed(ec, rd); }
+            ,[this, buf=std::move(buf)]
+             (const bs::error_code &ec, std::size_t rd) mutable
+             { on_readed(std::move(buf), ec, rd); }
         );
     }
-    void on_readed(const bs::error_code &ec, std::size_t rd) {
+    void on_readed(shared_buffer buf, const bs::error_code &ec, std::size_t rd) {
         if ( ec ) {
-            std::cerr << "read error: " << ec << std::endl;
+            std::cerr << "read error: " << ec.message() << std::endl;
 
             return;
         }
 
-        auto str = m_buf.substr(0, rd);
-        m_buf.erase(0, rd);
+        auto str = make_buffer(buf->data(), buf->data() + rd);
+        buf->erase(buf->begin(), buf->begin() + rd);
 
-        std::cout << "readed: " << str << std::flush;
+        std::cout << "readed: " << *str << std::flush;
+
+        start_read(std::move(buf));
     }
 
-    void send_impl(std::string str) {
-        //std::cout << "send_impl" << std::endl;
-        const auto *ptr = str.data();
-        const auto size = str.size();
+    void send_impl(shared_buffer str) {
+        //std::cout << "send_impl: " << str << ", addr=" << (const void *)str.data() << std::endl;
+        auto *ptr = str.get();
         ba::async_write(
              m_socket
-            ,ba::buffer(ptr, size)
+            ,ba::dynamic_buffer(*ptr)
             ,[this, str=std::move(str)]
-             (const bs::error_code &ec, std::size_t wr)
-             { on_sent(ec, wr); }
+             (const bs::error_code &ec, std::size_t wr) mutable
+             { on_sent(std::move(str), ec, wr); }
         );
     }
-    void on_sent(const bs::error_code &ec, std::size_t) {
-        //std::cout << "on_sent" << std::endl;
+    void on_sent(shared_buffer /*str*/, const bs::error_code &ec, std::size_t) {
+        //std::cout << "on_sent: " << str << ", addr=" << (const void *)str.data() << std::endl;
         if ( ec ) {
             std::cerr  << "send error: " << ec << std::endl;
         }
@@ -123,7 +137,6 @@ private:
 
 private:
     tcp::socket m_socket;
-    std::string m_buf;
     std::string m_ip;
     std::uint16_t m_port;
     std::string m_state_fname;
@@ -142,7 +155,7 @@ struct term_reader {
         ,m_stdin{m_ioctx, ::dup(STDIN_FILENO)}
     {}
 
-    // CB's signature: void(error_code, std::string)
+    // CB's signature: void(error_code, shared_buffer)
     template<typename CB>
     void start(CB cb) {
         assert(m_stdin.is_open());
@@ -151,31 +164,32 @@ struct term_reader {
              m_stdin.get_executor()
             ,[this, cb=std::move(cb)]
              () mutable
-             { read(std::move(cb)); }
+            { read(make_buffer(), std::move(cb)); }
         );
     }
 
 private:
     template<typename CB>
-    void read(CB cb) {
+    void read(shared_buffer buf, CB cb) {
+        auto *str = buf.get();
         ba::async_read_until(
              m_stdin
-            ,ba::dynamic_buffer(m_buf)
+            ,ba::dynamic_buffer(*str)
             ,'\n'
-            ,[this, cb=std::move(cb)]
+            ,[this, buf=std::move(buf), cb=std::move(cb)]
              (const bs::error_code &ec, std::size_t rd) mutable
-             { readed(ec, rd, std::move(cb)); }
+             { readed(ec, rd, std::move(buf), std::move(cb)); }
         );
     }
     template<typename CB>
-    void readed(const bs::error_code &ec, std::size_t rd, CB cb) {
+    void readed(const bs::error_code &ec, std::size_t rd, shared_buffer buf, CB cb) {
         if ( ec ) {
-            cb(ec, std::string{});
+            cb(ec, shared_buffer{});
         } else {
-            auto str = m_buf.substr(0, rd);
-            m_buf.erase(0, rd);
+            auto str = make_buffer(buf->data(), buf->data() + rd);
+            buf->erase(buf->begin(), buf->begin() + rd);
 
-            if ( str == "exit\n" ) {
+            if ( *str == "exit\n" ) {
                 m_ioctx.stop();
 
                 return;
@@ -183,14 +197,13 @@ private:
 
             cb(ec, std::move(str));
 
-            read(std::move(cb));
+            read(std::move(buf), std::move(cb));
         }
     }
 
 private:
     ba::io_context &m_ioctx;
     ba::posix::stream_descriptor m_stdin;
-    std::string m_buf;
 };
 
 /**********************************************************************************************************************/
@@ -202,7 +215,7 @@ struct: cmdargs::kwords_group {
     CMDARGS_OPTION_ADD(ping, std::size_t, "ping interval in seconds (not used if not specified)", optional);
 
     CMDARGS_OPTION_ADD_HELP();
-} static const kwords;
+} const kwords;
 
 /**********************************************************************************************************************/
 
@@ -242,11 +255,11 @@ int main(int argc, char **argv) try {
     // for reading `stdin` asynchronously
     term_reader term{ioctx};
     term.start(
-        [&cli](const bs::error_code &ec, std::string str){
+        [&cli](const bs::error_code &ec, shared_buffer str){
             if ( ec ) {
-                std::cout << "term: read error: " << ec << std::endl;
+                //std::cout << "term: read error: " << ec << std::endl;
             } else {
-                //std::cout << "term: str=" << str << std::endl;
+                std::cout << "term: str=" << *str << std::flush;
                 cli.send(std::move(str));
             }
         }

@@ -5,13 +5,30 @@ project(asio-shared-state-client LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(ENABLE_ASAN, "Enable AddressSanitizer")
+option(ENABLE_LSAN, "Enable LeakSanitizer")
+option(ENABLE_TSAN, "Enable ThreadSanitizer")
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer") # -fsanitize=address -fsanitize=leak -fsanitize=thread
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
 endif()
 
+if(ENABLE_ASAN)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+endif()
+
+if(ENABLE_LSAN)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak")
+endif()
+
+if(ENABLE_TSAN)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
+endif()
+
+message("g++ cmdline:${CMAKE_CXX_FLAGS}")
+
 add_executable(${PROJECT_NAME} client.cpp)
-target_link_options(${PROJECT_NAME} PUBLIC "-static")
 target_include_directories(${PROJECT_NAME} PRIVATE "../cmdargs/include")
 
 install(TARGETS ${PROJECT_NAME}
