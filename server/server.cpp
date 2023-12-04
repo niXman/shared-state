@@ -11,7 +11,6 @@
 // Copyright (c) 2023 niXman (github dot nixman dog pm.me). All rights reserved.
 // ----------------------------------------------------------------------------
 
-
 #include <boost/asio.hpp>
 #include <boost/uuid/detail/sha1.hpp>
 

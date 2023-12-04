@@ -1,1 +1,3 @@
-N=100; idx=0; pwgen -1 16 $N | while read LINE; do echo "key-$idx val-$LINE"; let "idx++"; done > $N.txt
+version https://git-lfs.github.com/spec/v1
+oid sha256:ee03e7b109ce37d1bf178a166bb782be61eaf77fe4be52289f195b0518562747
+size 105
