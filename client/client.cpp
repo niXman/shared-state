@@ -145,7 +145,7 @@ private:
     void on_sent(shared_buffer str, const bs::error_code &ec, std::size_t) {
         //std::cout << "on_sent: " << str << ", addr=" << (const void *)str.data() << std::endl;
         if ( ec ) {
-            std::cerr  << "send error: " << ec << std::endl;
+            std::cerr  << "send error: " << ec.message() << std::endl;
         }
 
         if ( !m_queue.empty() ) {
@@ -272,7 +272,7 @@ int main(int argc, char **argv) try {
             if ( !ec ) {
                 std::cout << "successfully connected!" << std::endl;
             } else {
-                std::cout << "connection error: " << ec << std::endl;
+                std::cout << "connection error: " << ec.message() << std::endl;
             }
         }
     );

@@ -139,7 +139,7 @@ struct shared_state {
         ,m_hasher{hasher}
     {}
 
-    // CB's signature: void(bool updated, const byte_buffer &key, const byte_buffer &hash)
+    // CB's signature: void(bool updated, const shared_buffer &key, const shared_buffer &hash, const shared_buffer &key_hash)
     template<typename CB>
     void update(shared_buffer key, shared_buffer val, CB cb) {
         ba::post(
@@ -161,7 +161,7 @@ struct shared_state {
         );
     }
 
-    // CB's signature: void(bool empty, const_iterator it, const byte_buffer &key, const byte_buffer &hash)
+    // CB's signature: void(bool empty, const_iterator it, const byte_buffer &key, const byte_buffer &hash, const byte_buffer &key_hash)
     template<typename CB>
     void get_first(CB cb) {
         ba::post(
@@ -171,7 +171,7 @@ struct shared_state {
              { get_first_impl(std::move(cb)); }
         );
     }
-    // CB's signature: void(bool at_end, const_iterator it, const byte_buffer &key, const byte_buffer &hash)
+    // CB's signature: void(bool at_end, const_iterator it, const byte_buffer &key, const byte_buffer &hash, const byte_buffer &key_hash)
     template<typename It, typename CB>
     void get_next(It it, CB cb) {
         ba::post(
@@ -193,9 +193,9 @@ private:
     void get_first_impl(CB cb) {
         auto it = m_map.begin();
         if ( it != m_map.end() ) {
-            cb(false, it, it->first, it->second);
+            cb(false, it, it->first, it->second.hash, it->second.key_hash);
         } else {
-            cb(true, it, shared_buffer{}, shared_buffer{});
+            cb(true, it, shared_buffer{}, shared_buffer{}, shared_buffer{});
         }
     }
 
@@ -203,9 +203,9 @@ private:
     void get_next_impl(It it, CB cb) {
         it = std::next(it);
         if ( it != m_map.end() ) {
-            cb(false, it, it->first, it->second);
+            cb(false, it, it->first, it->second.hash, it->second.key_hash);
         } else {
-            cb(true, it, shared_buffer{}, shared_buffer{});
+            cb(true, it, shared_buffer{}, shared_buffer{}, shared_buffer{});
         }
     }
 
@@ -234,23 +234,33 @@ private:
         // check for key
         auto it = m_map.find(key);
         if ( it == m_map.end() ) {
-            auto inserted = m_map.emplace(std::move(key), std::move(hash));
-            cb(true, inserted.first->first, inserted.first->second);
+            auto key_hash = make_buffer(*key);
+            *key_hash += ' ';
+            *key_hash += *hash;
+            *key_hash += '\n';
+            auto inserted = m_map.emplace(std::move(key), map_value{std::move(hash), std::move(key_hash)});
+            cb(true, inserted.first->first, inserted.first->second.hash, inserted.first->second.key_hash);
 
             return;
         }
 
         // check for val
-        if ( *(it->second) != *hash ) {
-            it->second = std::move(hash);
+        if ( *(it->second.hash) != *hash ) {
+            auto key_hash = make_buffer(*(it->first));
+            *key_hash += ' ';
+            *key_hash += *hash;
+            *key_hash += '\n';
 
-            cb(true, it->first, it->second);
+            it->second.hash = std::move(hash);
+            it->second.key_hash = std::move(key_hash);
+
+            cb(true, it->first, it->second.hash, it->second.key_hash);
 
             return;
         }
 
         // no changes case
-        cb(false, shared_buffer{}, shared_buffer{});
+        cb(false, shared_buffer{}, shared_buffer{}, shared_buffer{});
     }
 
 private:
@@ -261,7 +271,11 @@ private:
             return *l < *r;
         }
     };
-    std::map<shared_buffer, shared_buffer, my_cmp> m_map;
+    struct map_value {
+        shared_buffer hash;
+        shared_buffer key_hash; // just for optimisation
+    };
+    std::map<shared_buffer, map_value, my_cmp> m_map;
     hasher m_hasher;
 };
 
@@ -284,8 +298,8 @@ struct session: std::enable_shared_from_this<session> {
         // start to sync the state
         m_state.get_first(
             [this]
-            (bool empty, auto it, const shared_buffer &key, const shared_buffer &hash)
-            { on_received_first(empty, it, key, hash); }
+            (bool empty, auto it, const shared_buffer &key, const shared_buffer &hash, const shared_buffer &key_hash)
+            { on_received_first(empty, it, key, hash, key_hash); }
         );
     }
 
@@ -307,24 +321,21 @@ struct session: std::enable_shared_from_this<session> {
 private:
     // called from shared_state's strand
     template<typename It>
-    void on_received_first(bool empty, It it, const shared_buffer &key, const shared_buffer &hash) {
+    void on_received_first(
+         bool empty
+        ,It it
+        ,const shared_buffer &/*key*/
+        ,const shared_buffer &/*hash*/
+        ,const shared_buffer &key_hash)
+    {
         if ( !empty ) {
-            //DEBUG_EXPR(std::cout << "on_got_message: empty == false" << std::endl;);
-
-            auto str = make_buffer(*key);
-            *str += ' ';
-            *str += *hash;
-            *str += '\n';
-
-            //DEBUG_EXPR(std::cout << "on_got_message: msg=" << *str << std::endl;);
-
             ba::post(
                  m_sock.get_executor()
-                ,[this, it, str=std::move(str)]
+                ,[this, it, key_hash]
                  () mutable
                  {
                     send(
-                         std::move(str)
+                         key_hash
                         ,[this, it]
                          (const bs::error_code &ec)
                          { on_get_first_sent(ec, it); }
@@ -346,8 +357,8 @@ private:
         m_state.get_next(
              it
             ,[this]
-             (bool at_end, auto it, const shared_buffer &key, const shared_buffer &hash)
-             { on_received_first(at_end, it, key, hash); }
+             (bool at_end, auto it, const shared_buffer &key, const shared_buffer &hash, const shared_buffer &key_hash)
+             { on_received_first(at_end, it, key, hash, key_hash); }
         );
     }
 
@@ -402,8 +413,8 @@ private:
              std::move(key)
             ,std::move(val)
             ,[this, broadcast_cb, holder]
-             (bool really, const shared_buffer &key, const shared_buffer &hash) mutable
-             { on_updated(really, key, hash, std::move(broadcast_cb), std::move(holder)); }
+             (bool really, const shared_buffer &key, const shared_buffer &hash, const shared_buffer &key_hash) mutable
+             { on_updated(really, key, hash, key_hash, std::move(broadcast_cb), std::move(holder)); }
         );
 
         start_read(std::move(broadcast_cb), std::move(buf), std::move(holder));
@@ -412,17 +423,20 @@ private:
 private:
     // called from shared_state's strand
     template<typename CB>
-    void on_updated(bool really, const shared_buffer &key, const shared_buffer &hash, CB broadcast_cb, holder_ptr /*holder*/) {
+    void on_updated(
+         bool really
+        ,const shared_buffer &/*key*/
+        ,const shared_buffer &/*hash*/
+        ,const shared_buffer &key_hash
+        ,CB broadcast_cb
+        ,holder_ptr /*holder*/)
+    {
         // when `really` == true, it's mean that `shared_state` was really updated
         if ( really ) {
-            auto msg = make_buffer(*key);
-            *msg += ' ';
-            (*msg).append(*hash);
-            *msg += '\n';
 
             //DEBUG_EXPR(std::cout << "broadcasting: " << *msg << std::flush;);
 
-            broadcast_cb(std::move(msg));
+            broadcast_cb(key_hash);
         }
     }
 
