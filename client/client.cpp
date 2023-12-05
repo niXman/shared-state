@@ -20,6 +20,7 @@ namespace bs = boost::system;
 using tcp = boost::asio::ip::tcp;
 
 #include <iostream>
+#include <queue>
 
 using shared_buffer = std::shared_ptr<std::string>;
 
@@ -39,6 +40,8 @@ struct client {
 
     client(ba::io_context &ioctx, const std::string &ip, std::uint16_t port, const std::string &fname, std::size_t ping)
         :m_socket{ioctx}
+        ,m_queue{}
+        ,m_on_write{false}
         ,m_ip{ip}
         ,m_port{port}
         ,m_state_fname{fname}
@@ -66,7 +69,7 @@ struct client {
              m_socket.get_executor()
             ,[this, str=std::move(str)]
              () mutable
-             { send_impl(std::move(str)); }
+             { push_to_queue(std::move(str)); }
         );
     }
 
@@ -110,13 +113,24 @@ private:
         }
 
         auto str = make_buffer(buf->data(), buf->data() + rd);
-        buf->erase(buf->begin(), buf->begin() + rd);
+        buf->erase(0, rd);
 
-        std::cout << "readed: " << *str << std::flush;
+        std::cout << "readed: " << *str;
 
         start_read(std::move(buf));
     }
 
+    void push_to_queue(shared_buffer str) {
+        m_queue.push(std::move(str));
+
+        if ( !m_on_write ) {
+            m_on_write = true;
+            str = std::move(m_queue.front());
+            m_queue.pop();
+
+            send_impl(std::move(str));
+        }
+    }
     void send_impl(shared_buffer str) {
         //std::cout << "send_impl: " << str << ", addr=" << (const void *)str.data() << std::endl;
         auto *ptr = str.get();
@@ -128,15 +142,26 @@ private:
              { on_sent(std::move(str), ec, wr); }
         );
     }
-    void on_sent(shared_buffer /*str*/, const bs::error_code &ec, std::size_t) {
+    void on_sent(shared_buffer str, const bs::error_code &ec, std::size_t) {
         //std::cout << "on_sent: " << str << ", addr=" << (const void *)str.data() << std::endl;
         if ( ec ) {
             std::cerr  << "send error: " << ec << std::endl;
+        }
+
+        if ( !m_queue.empty() ) {
+            str = std::move(m_queue.front());
+            m_queue.pop();
+
+            send_impl(std::move(str));
+        } else {
+            m_on_write = false;
         }
     }
 
 private:
     tcp::socket m_socket;
+    std::queue<shared_buffer> m_queue;
+    bool m_on_write;
     std::string m_ip;
     std::uint16_t m_port;
     std::string m_state_fname;
@@ -187,7 +212,7 @@ private:
             cb(ec, shared_buffer{});
         } else {
             auto str = make_buffer(buf->data(), buf->data() + rd);
-            buf->erase(buf->begin(), buf->begin() + rd);
+            buf->erase(0, rd);
 
             if ( *str == "exit\n" ) {
                 m_ioctx.stop();
@@ -259,7 +284,7 @@ int main(int argc, char **argv) try {
             if ( ec ) {
                 //std::cout << "term: read error: " << ec << std::endl;
             } else {
-                std::cout << "term: str=" << *str << std::flush;
+                //std::cout << "term: str=" << *str;;
                 cli.send(std::move(str));
             }
         }

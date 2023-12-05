@@ -11,6 +11,8 @@
 // Copyright (c) 2023 niXman (github dot nixman dog pm.me). All rights reserved.
 // ----------------------------------------------------------------------------
 
+#include "cmdargs/cmdargs.hpp"
+
 #include <boost/asio.hpp>
 #include <boost/uuid/detail/sha1.hpp>
 
@@ -44,9 +46,11 @@ shared_buffer make_buffer(const char *beg, const char *end) {
 /**********************************************************************************************************************/
 
 struct hasher {
-    hasher(ba::io_context &ioc)
+    hasher(ba::io_context &ioc, std::size_t recalculate)
         :m_ioc{ioc}
         ,m_strand{ioc}
+        ,m_queue{}
+        ,m_recalculate{recalculate}
     {}
 
     // CB's signature: void(std::string hash)
@@ -73,16 +77,20 @@ private:
              m_ioc
             ,[this, it]() {
                 boost::uuids::detail::sha1 sha1;
-                sha1.process_bytes(it->str->data(), it->str->size());
-                unsigned hash_dig[5] = {0};
-                sha1.get_digest(hash_dig);
-
                 char hash_buf[43] = {'0', 'x'};
-                char *hash_buf_it = hash_buf + 2;
-                auto *dig_it = std::begin(hash_dig);
-                for ( ; dig_it != std::end(hash_dig); ++dig_it, hash_buf_it += 8 ) {
-                    std::sprintf(hash_buf_it, "%08x", *dig_it);
+
+                for ( auto idx = 0u; idx != m_recalculate; ++idx ) {
+                    unsigned hash_dig[5] = {0};
+                    sha1.process_bytes(it->str->data(), it->str->size());
+                    sha1.get_digest(hash_dig);
+
+                    char *hash_buf_it = hash_buf + 2;
+                    auto *dig_it = std::begin(hash_dig);
+                    for ( ; dig_it != std::end(hash_dig); ++dig_it, hash_buf_it += 8 ) {
+                        std::sprintf(hash_buf_it, "%08x", *dig_it);
+                    }
                 }
+
                 auto hash = make_buffer(hash_buf, hash_buf + 42);
                 // when finished - post back to our strand
                 ba::post(
@@ -120,14 +128,15 @@ private:
     using queue_iterator = queue_type::iterator;
 
     queue_type m_queue;
+    std::size_t m_recalculate;
 };
 
 /**********************************************************************************************************************/
 
 struct shared_state {
-    shared_state(ba::io_context &ioc)
+    shared_state(ba::io_context &ioc, hasher &hasher)
         :m_strand{ioc}
-        ,m_hasher{ioc}
+        ,m_hasher{hasher}
     {}
 
     // CB's signature: void(bool updated, const byte_buffer &key, const byte_buffer &hash)
@@ -267,16 +276,16 @@ struct session: std::enable_shared_from_this<session> {
         ,m_state{state}
     {}
 
-    // CB's signature: void(shared_buf)
-    template<typename CB>
-    void start(CB broadcast_cb, holder_ptr holder) {
+    // BroadcastCB's signature: void(shared_buf)
+    template<typename BroadcastCB>
+    void start(BroadcastCB broadcast_cb, holder_ptr holder) {
         start_read(std::move(broadcast_cb), make_buffer(), std::move(holder));
 
         // start to sync the state
         m_state.get_first(
             [this]
             (bool empty, auto it, const shared_buffer &key, const shared_buffer &hash)
-            { on_got_message(empty, it, key, hash); }
+            { on_received_first(empty, it, key, hash); }
         );
     }
 
@@ -293,10 +302,12 @@ struct session: std::enable_shared_from_this<session> {
         );
     }
 
+    tcp::endpoint endpoint() const { return m_sock.remote_endpoint(); }
+
 private:
     // called from shared_state's strand
     template<typename It>
-    void on_got_message(bool empty, It it, const shared_buffer &key, const shared_buffer &hash) {
+    void on_received_first(bool empty, It it, const shared_buffer &key, const shared_buffer &hash) {
         if ( !empty ) {
             //DEBUG_EXPR(std::cout << "on_got_message: empty == false" << std::endl;);
 
@@ -336,7 +347,7 @@ private:
              it
             ,[this]
              (bool at_end, auto it, const shared_buffer &key, const shared_buffer &hash)
-             { on_got_message(at_end, it, key, hash); }
+             { on_received_first(at_end, it, key, hash); }
         );
     }
 
@@ -350,11 +361,11 @@ private:
             ,'\n'
             ,[this, buf=std::move(buf), broadcast_cb=std::move(broadcast_cb), holder=std::move(holder)]
              (const bs::error_code& ec, std::size_t size) mutable
-            { on_readed(std::move(buf), std::move(broadcast_cb), ec, size, std::move(holder)); }
+             { on_readed(std::move(broadcast_cb), std::move(buf), ec, size, std::move(holder)); }
         );
     }
     template<typename CB>
-    void on_readed(shared_buffer buf, CB broadcast_cb, const bs::error_code& ec, std::size_t rd, holder_ptr holder) {
+    void on_readed(CB broadcast_cb, shared_buffer buf, const bs::error_code& ec, std::size_t rd, holder_ptr holder) {
         if ( ec ) {
             if ( ec == ba::error::eof ) {
                 std::cerr
@@ -369,21 +380,23 @@ private:
             return;
         }
 
-        std::string_view sv{buf->data(), rd};
-        auto pos = sv.find(' ');
+        std::string_view buf_view{buf->data(), rd};
+        auto pos = buf_view.find(' ');
         if ( pos == std::string_view::npos ) {
-            std::cerr << "wrong string received: \"" << sv << "\"" << std::endl;
+            std::cerr << "wrong string received: \"" << buf_view << "\"" << std::endl;
+
+            buf->erase(0, rd);
 
             start_read(std::move(broadcast_cb), std::move(buf), std::move(holder));
 
             return;
         } else {
-            DEBUG_EXPR(std::cout << "on_readed: str=" << sv << std::flush;);
+            //DEBUG_EXPR(std::cout << "on_readed: str=" << sv << std::flush;);
         }
-        auto key = make_buffer(sv.data(), sv.data() + pos);
-        auto val = make_buffer(sv.data() + pos + 1, sv.data() + sv.size());
+        auto key = make_buffer(buf_view.data(), buf_view.data() + pos);
+        auto val = make_buffer(buf_view.data() + pos + 1, buf_view.data() + buf_view.size());
 
-        buf->erase(buf->begin(), buf->begin() + rd);
+        buf->erase(0, rd);
 
         m_state.update(
              std::move(key)
@@ -407,7 +420,7 @@ private:
             (*msg).append(*hash);
             *msg += '\n';
 
-            DEBUG_EXPR(std::cout << "broadcasting: " << *msg << std::flush;);
+            //DEBUG_EXPR(std::cout << "broadcasting: " << *msg << std::flush;);
 
             broadcast_cb(std::move(msg));
         }
@@ -487,9 +500,9 @@ private:
 /**********************************************************************************************************************/
 
 struct acceptor {
-    acceptor(ba::io_context &ioc, std::uint16_t port, session_manager &smgr, shared_state &state)
+    acceptor(ba::io_context &ioc, const std::string &ip, std::uint16_t port, session_manager &smgr, shared_state &state)
         :m_ioc{ioc}
-        ,m_acc{ba::make_strand(m_ioc), tcp::endpoint{tcp::v4(), port}}
+        ,m_acc{ba::make_strand(m_ioc), tcp::endpoint{ba::ip::make_address(ip), port}}
         ,m_smgr{smgr}
         ,m_state{state}
     {
@@ -497,37 +510,53 @@ struct acceptor {
         m_acc.set_option(tcp::no_delay{true}); // can throw
     }
 
-    void start() {
+    // OnConnectedCB's signature: void(ba::endpoint client_endpoint, std::size_t num_of_pairs)
+    template<typename OnConnectedCB>
+    void start(OnConnectedCB on_connected_cb) {
         m_acc.async_accept(
              ba::make_strand(m_ioc)
-            ,[this](const bs::error_code &ec, tcp::socket sock)
-             { on_accepted(ec, std::move(sock)); }
+            ,[this, on_connected_cb=std::move(on_connected_cb)]
+             (const bs::error_code &ec, tcp::socket sock) mutable
+             { on_accepted(std::move(on_connected_cb), ec, std::move(sock)); }
         );
     }
 
 private:
-    void on_accepted(const bs::error_code &ec, tcp::socket sock) {
+    template<typename OnConnectedCB>
+    void on_accepted(OnConnectedCB on_connected_cb, const bs::error_code &ec, tcp::socket sock) {
         if ( ec ) {
             std::cerr << "acceptor error: " << ec << std::endl;
 
             return;
         }
 
-        const auto rep = sock.remote_endpoint();
-        DEBUG_EXPR(std::cout << "new connection from: " << rep.address().to_string() << ":" << rep.port() << std::endl;);
-
-        auto sptr = std::make_shared<session>(std::move(sock), m_state);
-
-        sptr->start(
-            [this]
-            (shared_buffer msg)
-            { m_smgr.broadcast(std::move(msg)); }
-            ,sptr->shared_from_this()
+        m_state.get_size(
+            [this, on_connected_cb, sock=std::move(sock)]
+            (std::size_t size) mutable {
+                ba::post(
+                     sock.get_executor()
+                    ,[this, size, on_connected_cb=std::move(on_connected_cb), sock=std::move(sock)]
+                     () mutable
+                     { on_size_received(std::move(on_connected_cb), size, std::move(sock)); }
+                );
+            }
         );
 
+        start(std::move(on_connected_cb));
+    }
+    template<typename OnConnectedCB>
+    void on_size_received(OnConnectedCB on_connected_cb, std::size_t size, tcp::socket sock) {
+        on_connected_cb(sock.remote_endpoint(), size);
+
+        auto sptr = std::make_shared<session>(std::move(sock), m_state);
         m_smgr.add(sptr);
 
-        start();
+        sptr->start(
+             [this]
+             (shared_buffer msg)
+             { m_smgr.broadcast(std::move(msg)); }
+            ,sptr->shared_from_this()
+        );
     }
 
 private:
@@ -539,24 +568,49 @@ private:
 
 /**********************************************************************************************************************/
 
+struct: cmdargs::kwords_group {
+    CMDARGS_OPTION_ADD(ip, std::string, "server IP", and_(port));
+    CMDARGS_OPTION_ADD(port, std::uint16_t, "server PORT", and_(ip));
+    CMDARGS_OPTION_ADD(threads, std::size_t, "the number of working threads", optional);
+    CMDARGS_OPTION_ADD(recalculate, std::size_t, "the number of recalculations of SHA1", optional);
+
+    CMDARGS_OPTION_ADD_HELP();
+} const kwords;
+
+/**********************************************************************************************************************/
+
 int main(int argc, char **argv) try {
-    if ( argc != 3 ) {
-        std::cout << "usage: " << argv[0] << " <PORT> <THREADS>(min 2)" << std::endl;
+    // command line processing
+    std::string error;
+    const auto args = cmdargs::parse_args(&error, argc, argv, kwords);
+    if ( !error.empty() ) {
+        std::cerr << "command line error: " << error << std::endl;
 
         return EXIT_FAILURE;
     }
+    if ( args.is_set(kwords.help) ) {
+        cmdargs::show_help(std::cout, argv[0], args);
 
-    std::uint16_t port = std::atoi(argv[1]);
-    int threads = std::atoi(argv[2]);
-    threads -= 1;
+        return EXIT_SUCCESS;
+    }
 
-    ba::io_context ioctx{threads};
-    ioctx.post([]{ std::cout << "server started..." << std::endl; });
+    const auto ip     = args.get(kwords.ip);
+    const auto port   = args.get(kwords.port);
+    const auto threads= args.is_set(kwords.threads) ? args.get(kwords.threads) : 2;
+    const auto recalc = args.is_set(kwords.recalculate) ? args.get(kwords.recalculate) : 1;
 
-    shared_state state{ioctx};
+    ba::io_context ioctx(threads);
+    ioctx.post([threads]{ std::cout << "server started with " << threads-1 << " threads..." << std::endl; });
+
+    hasher hasher{ioctx, recalc};
+    shared_state state{ioctx, hasher};
     session_manager smgr{ioctx};
-    acceptor acc{ioctx, port, smgr, state};
-    acc.start();
+    acceptor acc{ioctx, ip, port, smgr, state};
+    acc.start(
+        []
+        (tcp::endpoint ep, std::size_t size)
+        { std::cout << "new connection from: " << ep.address().to_string() << ", will send " << size << " pairs..." << std::endl; }
+    );
 
     ba::signal_set signals{ioctx, SIGINT, SIGTERM};
     signals.async_wait([&ioctx](const bs::error_code &, int) {
@@ -567,7 +621,7 @@ int main(int argc, char **argv) try {
 
     std::vector<std::thread> threadsv;
     threadsv.reserve(threads);
-    for ( ; threads; --threads ) {
+    for ( auto n = threads-1; n; --n ) {
         threadsv.emplace_back([&ioctx]{ ioctx.run(); });
     }
 
