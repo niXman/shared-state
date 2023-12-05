@@ -259,10 +259,10 @@ int main(int argc, char **argv) try {
         return EXIT_SUCCESS;
     }
 
-    const auto &ip    = args.get(kwords.ip);
-    const auto port   = args.get(kwords.port);
-    const auto &fname = args.is_set(kwords.fname) ? args.get(kwords.fname) : std::string{};
-    const auto ping   = args.is_set(kwords.ping) ? args.get(kwords.ping) : 0;
+    const auto ip    = args.get(kwords.ip);
+    const auto port  = args.get(kwords.port);
+    const auto fname = args.get(kwords.fname, std::string{});
+    const auto ping  = args.get(kwords.ping, 0);
 
     // io_context + client
     ba::io_context ioctx;

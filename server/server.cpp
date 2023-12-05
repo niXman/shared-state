@@ -610,8 +610,8 @@ int main(int argc, char **argv) try {
 
     const auto ip     = args.get(kwords.ip);
     const auto port   = args.get(kwords.port);
-    const auto threads= args.is_set(kwords.threads) ? args.get(kwords.threads) : 2;
-    const auto recalc = args.is_set(kwords.recalculate) ? args.get(kwords.recalculate) : 1;
+    const auto threads= args.get(kwords.threads, 2);
+    const auto recalc = args.get(kwords.recalculate, 1);
 
     ba::io_context ioctx(threads);
     ioctx.post([threads]{ std::cout << "server started with " << threads-1 << " threads..." << std::endl; });
