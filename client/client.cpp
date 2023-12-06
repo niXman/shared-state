@@ -34,7 +34,7 @@ shared_buffer make_buffer(const char *beg, const char *end) {
 
 /**********************************************************************************************************************/
 
-struct client {
+struct client final {
     client(const client &) = delete;
     client& operator= (const client &) = delete;
 
@@ -47,10 +47,12 @@ struct client {
         ,m_state_fname{fname}
         ,m_ping{ping}
         ,m_ping_timer{ioctx}
+        ,m_timeout_timer{ioctx}
     {}
 
-    ~client()
-    {}
+    ~client() {
+        stop();
+    }
 
     // CB's signature when specified: void(error_code)
     template<typename ...CB>
@@ -61,6 +63,13 @@ struct client {
         } else {
             return start_impl(std::move(cb)...);
         }
+    }
+    void stop() {
+        m_socket.shutdown(tcp::socket::shutdown_send);
+        m_socket.close();
+        m_ping_timer.cancel();
+        m_timeout_timer.cancel();
+        m_on_write = false;
     }
 
     void send(shared_buffer str) {
@@ -91,8 +100,7 @@ private:
             return;
         }
 
-        auto buf = make_buffer();
-        start_read(std::move(buf));
+        start_read(make_buffer());
     }
     void start_read(shared_buffer buf) {
         auto *ptr = buf.get();
@@ -167,6 +175,7 @@ private:
     std::string m_state_fname;
     std::size_t m_ping;
     ba::steady_timer m_ping_timer;
+    ba::steady_timer m_timeout_timer;
 };
 
 /**********************************************************************************************************************/
@@ -236,8 +245,8 @@ private:
 struct: cmdargs::kwords_group {
     CMDARGS_OPTION_ADD(ip, std::string, "server IP", and_(port));
     CMDARGS_OPTION_ADD(port, std::uint16_t, "server PORT", and_(ip));
-    CMDARGS_OPTION_ADD(fname, std::string, "the state file name (not used if not specified)", optional);
-    CMDARGS_OPTION_ADD(ping, std::size_t, "ping interval in seconds (not used if not specified)", optional);
+    CMDARGS_OPTION_ADD(fname, std::string, "the state file name (not used if not specified)", optional, default_<std::string>("tablestate.txt"));
+    CMDARGS_OPTION_ADD(ping, std::size_t, "ping interval in milliseconds (not used if not specified)", optional, default_<std::size_t>(1000));
 
     CMDARGS_OPTION_ADD_HELP();
 } const kwords;
@@ -261,8 +270,8 @@ int main(int argc, char **argv) try {
 
     const auto ip    = args.get(kwords.ip);
     const auto port  = args.get(kwords.port);
-    const auto fname = args.get(kwords.fname, std::string{});
-    const auto ping  = args.get(kwords.ping, 0);
+    const auto fname = args.get(kwords.fname);
+    const auto ping  = args.get(kwords.ping);
 
     // io_context + client
     ba::io_context ioctx;
@@ -282,7 +291,7 @@ int main(int argc, char **argv) try {
     term.start(
         [&cli](const bs::error_code &ec, shared_buffer str){
             if ( ec ) {
-                //std::cout << "term: read error: " << ec << std::endl;
+                std::cout << "term: read error: " << ec << std::endl;
             } else {
                 //std::cout << "term: str=" << *str;;
                 cli.send(std::move(str));
