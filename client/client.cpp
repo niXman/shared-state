@@ -13,6 +13,8 @@
 
 #include "cmdargs/cmdargs.hpp"
 
+#include "../common/common.hpp"
+
 #include <boost/asio.hpp>
 
 namespace ba = boost::asio;
@@ -22,30 +24,20 @@ using tcp = boost::asio::ip::tcp;
 #include <iostream>
 #include <queue>
 
-using shared_buffer = std::shared_ptr<std::string>;
-
-shared_buffer make_buffer(std::string str = {}) {
-    return std::make_shared<shared_buffer::element_type>(std::move(str));
-}
-
-shared_buffer make_buffer(const char *beg, const char *end) {
-    return make_buffer(std::string{beg, end});
-}
-
 /**********************************************************************************************************************/
 
 struct client final {
     client(const client &) = delete;
     client& operator= (const client &) = delete;
 
-    client(ba::io_context &ioctx, const std::string &ip, std::uint16_t port, const std::string &fname, std::size_t ping)
+    client(ba::io_context &ioctx, const std::string &ip, std::uint16_t port, const std::string &fname, std::size_t ping_ms)
         :m_socket{ioctx}
         ,m_queue{}
         ,m_on_write{false}
         ,m_ip{ip}
         ,m_port{port}
         ,m_state_fname{fname}
-        ,m_ping{ping}
+        ,m_ping_ms{ping_ms}
         ,m_ping_timer{ioctx}
         ,m_timeout_timer{ioctx}
     {}
@@ -82,6 +74,8 @@ struct client final {
         );
     }
 
+    std::size_t avg_latency() const { return m_avg.avg(); }
+
 private:
     template<typename CB>
     void start_impl(CB cb) {
@@ -99,6 +93,9 @@ private:
         if ( ec ) {
             return;
         }
+
+        start_ping();
+        restart_timeout_timer();
 
         start_read(make_buffer());
     }
@@ -124,8 +121,38 @@ private:
         buf->erase(0, rd);
 
         std::cout << "readed: " << *str;
+        bool ok = handle_incomming(
+             std::move(str)
+            ,[this](shared_buffer val, holder_ptr){ handle_ping(std::move(val)); } // PING
+            ,[this](shared_buffer val, holder_ptr){ handle_sync(std::move(val)); } // SYNC
+            ,[this](shared_buffer val, holder_ptr){ handle_data(std::move(val)); } // DATA
+            ,holder_ptr{}
+        );
+        if ( !ok ) {
+
+        }
 
         start_read(std::move(buf));
+    }
+
+    void handle_ping(shared_buffer val) {
+        val->erase(0, 5);
+        val->pop_back();
+
+        auto cur_time = ms_time();
+        auto prev_time = std::strtoul(val->data(), nullptr, 10);
+        assert(prev_time != 0 && prev_time < ULONG_MAX);
+        auto diff = cur_time - prev_time;
+        //std::cout << "diff=" << diff << std::endl;
+
+        restart_timeout_timer();
+        m_avg.update(diff);
+    }
+    void handle_sync(shared_buffer val) {
+
+    }
+    void handle_data(shared_buffer val) {
+
     }
 
     void push_to_queue(shared_buffer str) {
@@ -166,6 +193,39 @@ private:
         }
     }
 
+    void start_ping() {
+        m_ping_timer.expires_after(std::chrono::milliseconds{m_ping_ms});
+        m_ping_timer.async_wait([this](bs::error_code ec){ send_ping(ec); });
+    }
+    void send_ping(bs::error_code ec) {
+        //std::cout << "ping!" << std::endl;
+        if ( ec ) {
+            std::cerr << "send_ping error: " << ec.message() << std::endl;
+
+            return;
+        }
+
+        auto time = ms_time();
+        auto timestr = std::to_string(time);
+
+        static const char *ping_str = "PING ";
+        auto str = make_buffer(ping_str, ping_str + 5);
+        str->append(timestr);
+        str->append(1, '\n');
+
+        send(str);
+
+        start_ping();
+    }
+    void restart_timeout_timer() {
+        m_timeout_timer.expires_after(std::chrono::milliseconds{m_ping_ms * 2});
+        m_timeout_timer.async_wait([this](bs::error_code ec){ on_timeout_timer_handler(ec); });
+    }
+    void on_timeout_timer_handler(bs::error_code ec) {
+        if ( ec == ba::error::operation_aborted ) { return; }
+        std::cout << "on_timeout_timer_handler: " << ec.message() << std::endl;
+    }
+
 private:
     tcp::socket m_socket;
     std::queue<shared_buffer> m_queue;
@@ -173,9 +233,10 @@ private:
     std::string m_ip;
     std::uint16_t m_port;
     std::string m_state_fname;
-    std::size_t m_ping;
+    std::size_t m_ping_ms;
     ba::steady_timer m_ping_timer;
     ba::steady_timer m_timeout_timer;
+    average<10> m_avg;
 };
 
 /**********************************************************************************************************************/
@@ -245,10 +306,13 @@ private:
 struct: cmdargs::kwords_group {
     CMDARGS_OPTION_ADD(ip, std::string, "server IP", and_(port));
     CMDARGS_OPTION_ADD(port, std::uint16_t, "server PORT", and_(ip));
-    CMDARGS_OPTION_ADD(fname, std::string, "the state file name (not used if not specified)", optional, default_<std::string>("tablestate.txt"));
-    CMDARGS_OPTION_ADD(ping, std::size_t, "ping interval in milliseconds (not used if not specified)", optional, default_<std::size_t>(1000));
+    CMDARGS_OPTION_ADD(fname, std::string, "the state file name (not used if not specified)"
+        ,optional, default_<std::string>("tablestate.txt"));
+    CMDARGS_OPTION_ADD(ping, std::size_t, "ping interval in MS (not used if not specified)"
+        ,optional, default_<std::size_t>(500));
 
     CMDARGS_OPTION_ADD_HELP();
+    CMDARGS_OPTION_ADD_VERSION("0.0.1");
 } const kwords;
 
 /**********************************************************************************************************************/
@@ -259,12 +323,12 @@ int main(int argc, char **argv) try {
     const auto args = cmdargs::parse_args(&error, argc, argv, kwords);
     if ( !error.empty() ) {
         std::cerr << "command line error: " << error << std::endl;
-
         return EXIT_FAILURE;
     }
-    if ( args.is_set(kwords.help) ) {
-        cmdargs::show_help(std::cout, argv[0], args);
-
+    if ( cmdargs::is_help_requested(std::cout, argv[0], kwords.help, args) ) {
+        return EXIT_SUCCESS;
+    }
+    if ( cmdargs::is_version_requested(std::cout, argv[0], kwords.version, args) ) {
         return EXIT_SUCCESS;
     }
 
@@ -289,9 +353,10 @@ int main(int argc, char **argv) try {
     // for reading `stdin` asynchronously
     term_reader term{ioctx};
     term.start(
-        [&cli](const bs::error_code &ec, shared_buffer str){
+        [&ioctx, &cli](const bs::error_code &ec, shared_buffer str){
             if ( ec ) {
-                std::cout << "term: read error: " << ec << std::endl;
+                std::cout << "term: read error: " << ec.message() << std::endl;
+                ioctx.stop();
             } else {
                 //std::cout << "term: str=" << *str;;
                 cli.send(std::move(str));
