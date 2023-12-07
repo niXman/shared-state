@@ -20,8 +20,11 @@ I'll add more information in the README.
 
 # Update Dec 4, 2023
 Answers to some questions:
-- It was the AJAX company: https://ajax.systems/
+- It was the `Ajax Systems` company: https://ajax.systems/
 - I fixed two bugs: 1) simultaneous access to a resource from several threads, 2) using `std::string` here was a mistake (I've never done this before, I usually used `vector<char>`). The thing is that `std::string` due to the presence of Small String Optimisation does not behave as you would expect, and instead of a real move of `std::string` object - copying occurs, which leads to invalidation of pointers to an internal char array. Now everything works as it should. Later I will add some optimizations for memory reuse and so on...
 
 # Update Dec 5, 2023
 The code was partially refactored.
+
+# Update Dec 7, 2023
+I received three letters about similar situations that occurred in 2022-2023.
