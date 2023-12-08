@@ -13,7 +13,7 @@
 
 #include "cmdargs/cmdargs.hpp"
 
-#include "../common/common.hpp"
+#include "../common/utils.hpp"
 
 #include <boost/asio.hpp>
 
@@ -325,10 +325,7 @@ int main(int argc, char **argv) try {
         std::cerr << "command line error: " << error << std::endl;
         return EXIT_FAILURE;
     }
-    if ( cmdargs::is_help_requested(std::cout, argv[0], kwords.help, args) ) {
-        return EXIT_SUCCESS;
-    }
-    if ( cmdargs::is_version_requested(std::cout, argv[0], kwords.version, args) ) {
+    if ( cmdargs::is_help_or_version_requested(std::cout, argv[0], args) ) {
         return EXIT_SUCCESS;
     }
 
