@@ -1,160 +1,145 @@
 
+// ----------------------------------------------------------------------------
+//                              Apache License
+//                        Version 2.0, January 2004
+//                     http://www.apache.org/licenses/
+//
+// This file is part of shared-state-server(https://github.com/niXman/shared-state-server) project.
+//
+// This was a test task for implementing multithreaded Shared-State server using asio.
+//
+// Copyright (c) 2023 niXman (github dot nixman dog pm.me). All rights reserved.
+// ----------------------------------------------------------------------------
+
 #ifndef __shared_state_server__state_storage_hpp__included
 #define __shared_state_server__state_storage_hpp__included
 
 #include "utils.hpp"
-#include "value_hasher.hpp"
+#include "string_buffer.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/intrusive/set.hpp>
 
 /**********************************************************************************************************************/
 
-struct state_storage: noncopyable_nonmovable {
-    state_storage(ba::io_context &ioc, value_hasher &hasher)
-        :m_strand{ioc}
-        ,m_hasher{hasher}
+struct state_storage {
+    state_storage(const state_storage &) = delete;
+    state_storage& operator= (const state_storage &) = delete;
+    state_storage(state_storage &&) = delete;
+    state_storage& operator= (state_storage &&) = delete;
+
+    state_storage(ba::io_context &ioctx)
+        :m_strand{ioctx}
+        ,m_map{}
     {}
 
-    // CB's signature: void(bool updated, const shared_buffer &key, const shared_buffer &hash, const shared_buffer &key_hash)
+    // CB's signature: void(shared_buffer buf)
+    // called only when the storage was really updated (a new key-val pair was added, or value for the concrete key was changed)
     template<typename CB>
-    void update(shared_buffer key, shared_buffer val, CB cb) {
-        ba::post(
+    auto update(const std::string_view key, const std::string_view val, shared_buffer buf, CB cb) {
+        return ba::post(
              m_strand
-            ,[this, key=std::move(key), val=std::move(val), cb=std::move(cb)]
+            ,[this, key, val, buf=std::move(buf), cb=std::move(cb)]
              () mutable
-             { calculate_hash(std::move(key), std::move(val), std::move(cb)); }
+             { update_impl(key, val, std::move(buf), std::move(cb)); }
         );
     }
 
-    auto get_size() {
-        return ba::post(m_strand, ba::use_future([this](){ return m_map.size(); }));
+    auto reset() {
+        return ba::post(
+             m_strand
+            ,ba::use_future([this](){ m_map.clear_and_dispose([](auto *p){ delete p; }); })
+        );
     }
 
-    template<typename Iter>
-    struct storage_item_type {
-        bool latest;
-        Iter iterator;
-        shared_buffer key;
-        shared_buffer hash;
-        shared_buffer key_hash;
-    };
+    auto size()
+    { return ba::post(m_strand, ba::use_future([this](){ return m_map.size(); })); }
 
 private:
-    template<typename Iter>
-    auto make_storage_item(
-         bool latest
-        ,Iter it
-        ,const shared_buffer &k
-        ,const shared_buffer &h
-        ,const shared_buffer &kh)
-    {
-        return storage_item_type<Iter>{latest, it, k, h, kh};
-    }
-
     auto get_first_impl() {
         auto it = m_map.begin();
         if ( it != m_map.end() ) {
-            return make_storage_item(false, it, it->first, it->second.hash, it->second.key_hash);
+            auto buf = it->key_val;
+            return std::make_tuple(false, it, std::move(buf));
         }
 
-        return make_storage_item(true, it, m_null_buffer, m_null_buffer, m_null_buffer);
+        return std::make_tuple(true, it, shared_buffer{});
     }
     template<typename Iter>
     auto get_next_impl(Iter it) {
         it = std::next(it);
         if ( it != m_map.end() ) {
-            return make_storage_item(false, it, it->first, it->second.hash, it->second.key_hash);
+            auto buf = it->key_val;
+            return std::make_tuple(false, it, std::move(buf));
         }
 
-        return make_storage_item(true, it, m_null_buffer, m_null_buffer, m_null_buffer);
+        return std::make_tuple(true, it, shared_buffer{});
     }
 
 public:
     auto get_first() {
-        return ba::post(m_strand, ba::use_future([this](){ return get_first_impl(); }));
+        auto fut = ba::post(m_strand, ba::use_future([this](){ return get_first_impl(); }));
+        return fut.get();
     }
 
     template<typename Iter>
-    auto get_next(const storage_item_type<Iter> &prev) {
-        Iter it = prev.iterator;
-        return ba::post(m_strand, ba::use_future([this, it](){ return get_next_impl(it); }));
+    auto get_next(Iter &it) {
+        auto fut = ba::post(m_strand, ba::use_future([this, it](){ return get_next_impl(it); }));
+        return fut.get();
     }
 
 private:
     template<typename CB>
-    void calculate_hash(shared_buffer key, shared_buffer val, CB cb) {
-        //DEBUG_EXPR(std::cout << "calculate_hash: key=" << *key << ", val=" << *val << std::endl;);
-
-        m_hasher.hash(
-            std::move(val)
-            ,[this, key=std::move(key), cb=std::move(cb)]
-            (shared_buffer hash) mutable {
-                // back to the our strand
-                ba::post(
-                    m_strand
-                    ,[this, hash=std::move(hash), key=std::move(key), cb=std::move(cb)]
-                    () mutable
-                    { hash_calculated(std::move(key), std::move(hash), std::move(cb)); }
-                    );
-            }
-        );
-    }
-    template<typename CB>
-    void hash_calculated(shared_buffer key, shared_buffer hash, CB cb) {
+    void update_impl(const std::string_view key, const std::string_view val, shared_buffer buf, CB cb) {
         //DEBUG_EXPR(std::cout << "hash_calculated: key=" << *key << ", hash=" << *hash << std::endl;);
 
         // check for key
         auto it = m_map.find(key);
         if ( it == m_map.end() ) {
-            auto key_hash = make_buffer(*key);
-            *key_hash += ' ';
-            *key_hash += *hash;
-            *key_hash += '\n';
-            auto inserted = m_map.emplace(std::move(key), map_value{std::move(hash), std::move(key_hash)});
-            cb(true, inserted.first->first, inserted.first->second.hash, inserted.first->second.key_hash);
+            auto *value = ::new map_value{key, val, std::move(buf)};
+            auto inserted = m_map.insert(*value);
+            cb(inserted.first->key_val);
 
             return;
         }
 
         // check for val
-        if ( *(it->second.hash) != *hash ) {
-            auto key_hash = make_buffer(*(it->first));
-            *key_hash += ' ';
-            *key_hash += *hash;
-            *key_hash += '\n';
+        if ( it->val != val ) {
+            it->key = key;
+            it->val = val;
+            it->key_val = std::move(buf);
 
-            it->second.hash = std::move(hash);
-            it->second.key_hash = std::move(key_hash);
-
-            cb(true, it->first, it->second.hash, it->second.key_hash);
+            cb(it->key_val);
 
             return;
         }
-
-        // no changes case
-        cb(false, shared_buffer{}, shared_buffer{}, shared_buffer{});
     }
 
 private:
+    struct map_value: boost::intrusive::set_base_hook<> {
+        map_value(const std::string_view k, const std::string_view v, shared_buffer kv)
+            :key{k}
+            ,val{v}
+            ,key_val{std::move(kv)}
+        {}
+
+        std::string_view key;
+        std::string_view val;
+        shared_buffer key_val;
+    };
+    struct get_key {
+        using type = std::string_view;
+        const type& operator() (const map_value &v) const noexcept
+        { return v.key; }
+    };
+
     ba::io_context::strand m_strand;
-
-    struct my_cmp {
-        bool operator()(const shared_buffer &l, const shared_buffer &r) const {
-            return *l < *r;
-        }
-    };
-    struct map_value {
-        shared_buffer hash;
-        shared_buffer key_hash; // just for optimisation
-    };
-    std::map<shared_buffer, map_value, my_cmp> m_map;
-    value_hasher &m_hasher;
-
-    static const shared_buffer m_null_buffer;
+    boost::intrusive::set<
+         map_value
+        ,boost::intrusive::key_of_value<get_key>
+    > m_map;
 };
-
-const shared_buffer state_storage::m_null_buffer{};
 
 /**********************************************************************************************************************/
 

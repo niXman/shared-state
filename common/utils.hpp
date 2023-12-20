@@ -1,15 +1,22 @@
 
+// ----------------------------------------------------------------------------
+//                              Apache License
+//                        Version 2.0, January 2004
+//                     http://www.apache.org/licenses/
+//
+// This file is part of shared-state-server(https://github.com/niXman/shared-state-server) project.
+//
+// This was a test task for implementing multithreaded Shared-State server using asio.
+//
+// Copyright (c) 2023 niXman (github dot nixman dog pm.me). All rights reserved.
+// ----------------------------------------------------------------------------
+
 #ifndef __shared_state_server__utils_hpp__included
 #define __shared_state_server__utils_hpp__included
 
-#include <array>
-#include <string>
-#include <memory>
 #include <chrono>
-#include <cstring>
 
 #include <boost/asio.hpp>
-#include <boost/uuid/detail/sha1.hpp>
 
 namespace ba = boost::asio;
 namespace bs = boost::system;
@@ -18,132 +25,54 @@ using tcp = boost::asio::ip::tcp;
 /**********************************************************************************************************************/
 // error processing
 
-#define CALL_ERROR_HANDLER(cb, ec) cb(__FILE__, __LINE__, __func__, ec)
-#define FORMAT_ERROR_MESSAGE(os, file, line, func, ec) \
-    os << file << "(" << line << "): " << func << ", error: " << ec.message() << std::endl
-
-/**********************************************************************************************************************/
-// noncopyable and nonmovable
-
-struct noncopyable_nonmovable {
-    noncopyable_nonmovable() = default;
-    virtual ~noncopyable_nonmovable() = default;
-
-    noncopyable_nonmovable(const noncopyable_nonmovable &) = delete;
-    noncopyable_nonmovable& operator= (const noncopyable_nonmovable &) = delete;
-
-    noncopyable_nonmovable(noncopyable_nonmovable &&) = delete;
-    noncopyable_nonmovable& operator= (noncopyable_nonmovable &&) = delete;
+struct error_info {
+    const char *descr;
+    const char *file;
+    int line;
+    const char *func;
+    int ecode;
+    std::string emsg;
 };
 
-/**********************************************************************************************************************/
-// forwards and holder_ptr
+inline std::ostream& operator<< (std::ostream &os, const error_info &ei) {
+    os << ei.descr << ": " << ei.file << "(" << ei.line << "): " << ei.func
+       << ", error: " << ei.emsg << " (" << ei.ecode << ")"
+    << std::flush;
 
-struct value_hasher;
-struct state_storage;
-struct session;
-struct session_manager;
-struct acceptor;
-
-using holder_ptr = std::shared_ptr<session>;
-
-/**********************************************************************************************************************/
-// shared buffer
-
-using shared_buffer = std::shared_ptr<std::string>;
-
-shared_buffer make_buffer(std::string str = {}) {
-    return std::make_shared<shared_buffer::element_type>(std::move(str));
+    return os;
 }
 
-shared_buffer make_buffer(const char *beg, const char *end) {
-    return make_buffer(std::string{beg, end});
+inline error_info make_error_info(
+     const char *descr
+    ,const char *file
+    ,int line
+    ,const char *func
+    ,int ec
+    ,const char *emsg)
+{
+    return {descr, file, line, func, ec, emsg};
 }
 
-/**********************************************************************************************************************/
-// fnv1a
-
-constexpr std::uint32_t fnv1a(std::string_view str) {
-    std::uint32_t seed = 0x811c9dc5;
-    for ( const auto *it = str.begin(); it != str.end(); ++it ) {
-        seed = (std::uint32_t)((seed ^ ((std::uint32_t)*it)) * ((std::uint64_t)0x01000193));
-    }
-
-    return seed;
+inline error_info make_error_info(
+     const char *descr
+    ,const char *file
+    ,int line
+    ,const char *func
+    ,const bs::error_code &ec)
+{
+    return {descr, file, line, func, ec.value(), ec.message()};
 }
+
+#define MAKE_ERROR_INFO(descr, ec) make_error_info(descr, __FILE__, __LINE__, __func__, ec)
+#define MAKE_ERROR_INFO_2(descr, ec, emsg) make_error_info(descr, __FILE__, __LINE__, __func__, ec, emsg)
+
+#define CALL_ERROR_HANDLER(cb, ei) cb(ei)
 
 /**********************************************************************************************************************/
 
 inline std::uint64_t ms_time() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-}
-
-/**********************************************************************************************************************/
-
-template<std::size_t N>
-struct average {
-    average()
-        :m_arr{{}}
-    {}
-
-    void update(std::size_t i) {
-        std::memcpy(m_arr.begin(), m_arr.begin() + 1, sizeof(std::size_t) * N-1);
-        m_arr.back() = i;
-    }
-
-    std::size_t avg() const {
-        std::size_t res = 0;
-        for ( const auto &it: m_arr ) {
-            res += it;
-        }
-
-        return res / N;
-    }
-private:
-    std::array<std::size_t, N> m_arr;
-};
-
-/**********************************************************************************************************************/
-
-// PING
-// SYNC
-// DATA
-
-template<typename ErrorCB, typename PingCB, typename SyncCB, typename DataCB>
-bool handle_incomming(
-     ErrorCB error_cb
-    ,shared_buffer str
-    ,PingCB ping_cb
-    ,SyncCB sync_cb
-    ,DataCB data_cb
-    ,holder_ptr holder)
-{
-    constexpr auto ping_hash = fnv1a("PING");
-    constexpr auto sync_hash = fnv1a("SYNC");
-    constexpr auto data_hash = fnv1a("DATA");
-
-    if ( str->length() > 4 && *(str->data() + 4) == ' ' ) {
-        auto key = std::string_view{str->data(), 4};
-        auto hash = fnv1a(key);
-        switch ( hash ) {
-            case ping_hash: {
-                ping_cb(std::move(error_cb), std::move(str), std::move(holder));
-                return true;
-            }
-            case sync_hash: {
-                sync_cb(std::move(error_cb), std::move(str), std::move(holder));
-                return true;
-            }
-            case data_hash: {
-                data_cb(std::move(error_cb), std::move(str), std::move(holder));
-                return true;
-            }
-            default: return false;
-        }
-    }
-
-    return false;
 }
 
 /**********************************************************************************************************************/
