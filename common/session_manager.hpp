@@ -24,6 +24,8 @@
 /**********************************************************************************************************************/
 
 struct session_manager {
+    using session_ptr = session::session_ptr;
+
     session_manager(const session_manager &) = delete;
     session_manager& operator= (const session_manager &) = delete;
     session_manager(session_manager &&) = delete;
@@ -44,9 +46,9 @@ struct session_manager {
         ,m_list{}
     {}
 
-    holder_ptr create(tcp::socket sock) {
+    auto create(tcp::socket sock) {
         auto sptr = m_ses_pool.get_del(
-             [this](session *s){ session_deleter_(s); }
+             [this](session *s){ session_deleter(s); }
             ,std::move(sock)
             ,m_max_size
             ,m_inactivity_time
@@ -75,8 +77,8 @@ struct session_manager {
     }
 
     template<typename ErrorCB>
-    auto broadcast(shared_buffer msg, bool disconnect, ErrorCB error_cb, holder_ptr holder) {
-        return ba::post(
+    void broadcast(shared_buffer msg, bool disconnect, ErrorCB error_cb, session_ptr holder) {
+        ba::post(
              m_strand
             ,ba::use_future(
                 [this, msg=std::move(msg), disconnect, error_cb=std::move(error_cb), holder=std::move(holder)]
@@ -91,24 +93,27 @@ struct session_manager {
              m_strand
             ,ba::use_future([this](){ return m_list.size(); })
         );
+
         return fut.get();
     }
 
 private:
     template<typename ErrorCB>
-    void broadcast_impl(shared_buffer msg, bool disconnect, ErrorCB error_cb, holder_ptr holder) {
+    void broadcast_impl(shared_buffer msg, bool disconnect, ErrorCB error_cb, session_ptr holder) {
         for ( auto it = m_list.begin(); it != m_list.end(); ++it ) {
-            it->send(
-                [](bool){}
-                ,error_cb
-                ,msg
-                ,disconnect
-                ,holder
-            );
+            if ( std::addressof(*it) != holder.get() ) {
+                it->send(
+                     [](bool){}
+                    ,error_cb
+                    ,msg
+                    ,disconnect
+                    ,holder
+                );
+            }
         }
     }
 
-    void session_deleter_(session *s) {
+    void session_deleter(session *s) {
         s->stop();
 
         ba::post(
@@ -116,6 +121,7 @@ private:
             ,[this, s](){
                 auto it = m_list.iterator_to(*s);
                 m_list.erase(it);
+                s->~session();
             }
         );
     }

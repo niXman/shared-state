@@ -22,8 +22,6 @@
 
 namespace details {
 
-/**********************************************************************************************************************/
-
 template<typename U>
 struct dereference_type {
     using type = U &;
@@ -33,8 +31,6 @@ template<>
 struct dereference_type<void> {
     using type = void;
 };
-
-/**********************************************************************************************************************/
 
 } // ns details
 
@@ -56,36 +52,35 @@ public:
     {
         static_cast<intrusive_base<T> *>(m_ptr)
             ->intrusive_set_deleter(details::default_delete<T>{});
-        static_cast<details::intrusive_base_base *>(m_ptr)->intrusive_increment_ref();
     }
     template<typename Deleter>
     intrusive_ptr(T *ptr, Deleter del) noexcept
         :m_ptr{ptr}
     {
         static_cast<intrusive_base<T> *>(m_ptr)
-            ->intrusive_set_deleter(details::user_delete<T, Deleter>{std::move(del)});
-        static_cast<details::intrusive_base_base *>(m_ptr)->intrusive_increment_ref();
+            ->intrusive_set_deleter(
+                details::user_delete<T, Deleter>{std::move(del)});
     }
 
     intrusive_ptr(const intrusive_ptr &r) noexcept
         :m_ptr{r.m_ptr}
     {
-        static_cast<details::intrusive_base_base *>(m_ptr)->intrusive_increment_ref();
+        static_cast<details::intrusive_base_base *>(m_ptr)
+            ->intrusive_increment_ref();
     }
     intrusive_ptr& operator= (const intrusive_ptr &r) noexcept {
         m_ptr = r.m_ptr;
-        static_cast<details::intrusive_base_base *>(m_ptr)->intrusive_increment_ref();
+        static_cast<details::intrusive_base_base *>(m_ptr)
+            ->intrusive_increment_ref();
 
         return *this;
     }
     intrusive_ptr(intrusive_ptr &&r) noexcept
-        :m_ptr{r.m_ptr}
-    {
-        r.m_ptr = nullptr;
-    }
+        :m_ptr{std::exchange(r.m_ptr, nullptr)}
+    {}
     intrusive_ptr& operator= (intrusive_ptr &&r) noexcept {
-        m_ptr = r.m_ptr;
-        r.m_ptr = nullptr;
+        if ( this != std::addressof(r) )
+            m_ptr = std::exchange(r.m_ptr, nullptr);
 
         return *this;
     }
@@ -105,6 +100,12 @@ public:
     using deref_t = typename details::dereference_type<T>::type;
     const deref_t operator*  ()   const noexcept { return *m_ptr; }
     deref_t       operator*  ()         noexcept { return *m_ptr; }
+
+    auto use_count() const noexcept {
+        return static_cast<details::intrusive_base_base *>(m_ptr)
+            ->intrusive_use_count();
+    }
+    auto unique() const noexcept { return use_count() == 1u; }
 };
 
 template<typename T, typename ...Args>

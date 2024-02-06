@@ -34,6 +34,8 @@
 #   define DEBUG_EXPR(...)
 #endif
 
+using session_ptr = session::session_ptr;
+
 /**********************************************************************************************************************/
 
 // PING - is sent only by the client to the server,
@@ -46,6 +48,18 @@
 // STOP - is sent by the server to clients in form "STOP \n", telling them that they should
 //        disconnect and reconnect later because the server will reset its state.
 
+static constexpr auto ALL_CMDS_LEN = 4u;
+
+static constexpr auto PING_CMD = std::string_view{"PING"};
+static_assert(PING_CMD.size() == ALL_CMDS_LEN);
+static constexpr auto PING_HASH = fnv1a(PING_CMD);
+
+static constexpr auto DATA_CMD = std::string_view{"DATA"};
+static_assert(DATA_CMD.size() == ALL_CMDS_LEN);
+static constexpr auto DATA_HASH = fnv1a(DATA_CMD);
+
+/**********************************************************************************************************************/
+
 void error_handler(const error_info &ei) {
     std::cerr << "error_handler> " << ei << std::endl;
 }
@@ -55,14 +69,14 @@ void error_handler(const error_info &ei) {
 // PING
 
 template<typename ErrorCB>
-bool handle_ping(const ErrorCB &error_cb, shared_buffer buf, holder_ptr holder) {
-    auto *sptr = holder.get();
-    sptr->send(
+bool handle_ping(const ErrorCB &error_cb, shared_buffer buf, session_ptr session) {
+    auto *session_ptr = session.get();
+    session_ptr->send(
          [](bool){}
         ,error_cb
         ,std::move(buf)
         ,false
-        ,std::move(holder)
+        ,std::move(session)
     );
 
     return true;
@@ -78,9 +92,9 @@ bool handle_data(
     ,state_storage &state
     ,session_manager &smgr
     ,shared_buffer buf
-    ,holder_ptr holder)
+    ,session_ptr session)
 {
-    const auto data = std::string_view{buf->data() + 5, buf->size() - 5};
+    const auto data = std::string_view{buf->data() + (4 + 1), buf->size() - (4 + 1)}; // 1 - because of space char
     const auto pos  = data.find(' ');
     if ( pos != std::string_view::npos ) {
         const auto key = data.substr(0, pos);
@@ -89,9 +103,9 @@ bool handle_data(
              key
             ,val
             ,std::move(buf)
-            ,[error_cb=std::move(error_cb), &smgr, holder=std::move(holder)]
+            ,[error_cb=std::move(error_cb), &smgr, session=std::move(session)]
              (shared_buffer buf) mutable
-             { smgr.broadcast(std::move(buf), false, std::move(error_cb), std::move(holder)); }
+             { smgr.broadcast(std::move(buf), false, std::move(error_cb), std::move(session)); }
         );
 
         return true;
@@ -109,21 +123,14 @@ bool on_readed(
     ,session_manager &smgr
     ,const ErrorCB &error_cb
     ,shared_buffer buf
-    ,holder_ptr holder)
+    ,session_ptr session)
 {
-    constexpr auto ping_cmd = fnv1a("PING");
-    constexpr auto data_cmd = fnv1a("DATA");
-
-    if ( buf->size() > 4 && *(buf->data() + 4) == ' ' ) {
-        std::string_view cmd{buf->data(), 4};
+    if ( buf->size() > ALL_CMDS_LEN && *(buf->data() + ALL_CMDS_LEN) == ' ' ) {
+        std::string_view cmd{buf->data(), ALL_CMDS_LEN};
         switch ( auto hash = fnv1a(cmd); hash ) {
-            case ping_cmd: { return handle_ping(error_cb, std::move(buf), std::move(holder)); }
-            case data_cmd: { return handle_data(error_cb, state, smgr, std::move(buf), std::move(holder)); }
-            default: {
-                CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO_2("on_readed", -1, "wrong line received!"));
-
-                return false;
-            }
+            case PING_HASH: { return handle_ping(error_cb, std::move(buf), std::move(session)); }
+            case DATA_HASH: { return handle_data(error_cb, state, smgr, std::move(buf), std::move(session)); }
+            default: { CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO_2("on_readed", -1, "wrong line received!")); return false; }
         }
     }
 
@@ -134,33 +141,37 @@ bool on_readed(
 // called on socket's strand
 
 template<typename Iter>
-void sync_next(state_storage &state, Iter prev, holder_ptr sptr) {
-    auto &&[latest, iter, buf] = state.get_next(prev);
+void sync_next(state_storage &state, Iter prev, session_ptr session) {
+    auto [latest, iter, buf] = state.get_next(std::move(prev));
     if ( !latest ) {
-        sptr->send(
-             [&state, iter, sptr]
+        auto *session_ptr = session.get();
+        auto session2 = session;
+        session_ptr->send(
+            [&state, iter=std::move(iter), session=std::move(session)]
              (bool sent)
-             { if ( sent ) sync_next(state, iter, std::move(sptr)); }
+             { if ( sent ) sync_next(state, std::move(iter), std::move(session)); }
             ,error_handler
             ,std::move(buf)
             ,false
-            ,sptr
+            ,std::move(session2)
         );
     }
 }
 
 // called on acceptor strand
-void start_sync(state_storage &state, holder_ptr sptr) {
-    auto &&[latest, iter, buf] = state.get_first();
+void start_sync(state_storage &state, session_ptr session) {
+    auto [latest, iter, buf] = state.get_first();
     if ( !latest ) {
-        sptr->send(
-             [sptr, &state, iter]
+        auto *session_ptr = session.get();
+        auto session2 = session;
+        session_ptr->send(
+            [&state, iter=std::move(iter), session=std::move(session)]
              (bool sent)
-             { if ( sent ) sync_next(state, iter, std::move(sptr)); }
+             { if ( sent ) sync_next(state, std::move(iter), std::move(session)); }
             ,error_handler
             ,std::move(buf)
             ,false
-            ,sptr
+            ,std::move(session2)
         );
     }
 }
@@ -178,16 +189,16 @@ void on_new_connection(state_storage &state, session_manager &smgr, tcp::socket 
     std::cout << "new connection from: " << addr
               << ", will send " << size_fut.get() << " pairs..." << std::endl;
 
-    auto sptr = smgr.create(std::move(sock));
-    sptr->start(
+    auto session = smgr.create(std::move(sock));
+    session->start(
          [&state, &smgr]
-         (shared_buffer buf, holder_ptr holder)
-         { return on_readed(state, smgr, error_handler, std::move(buf), std::move(holder)); }
+         (shared_buffer buf, session_ptr session)
+         { return on_readed(state, smgr, error_handler, std::move(buf), std::move(session)); }
         ,error_handler
-        ,sptr
+        ,session
     );
 
-    start_sync(state, std::move(sptr));
+    start_sync(state, std::move(session));
 }
 
 /**********************************************************************************************************************/
@@ -199,9 +210,7 @@ void start_statistics_timer(
     ,session_manager &smgr
     ,std::unique_ptr<ba::steady_timer> timer = {})
 {
-    if ( !timer ) {
-        timer = std::make_unique<ba::steady_timer>(ioctx);
-    }
+    timer = (!timer) ? std::make_unique<ba::steady_timer>(ioctx) : std::move(timer);
 
     auto *timer_ptr = timer.get();
     timer_ptr->expires_from_now(std::chrono::seconds(1));
@@ -238,7 +247,6 @@ void start_signal_handler(
         [&ioctx, &acc, &smgr, &state, signals=std::move(signals)]
         (bs::error_code, int sig) mutable {
             std::cout << "SIG" << sigabbrev_np(sig) << " signal received!" << std::endl;
-#if 1
             if ( sig == SIGINT || sig == SIGTERM ) {
                 ioctx.stop();
             } else {
@@ -280,7 +288,6 @@ void start_signal_handler(
                     ,std::move(signals)
                 );
             }
-#endif // 0
         }
     );
 }
@@ -294,7 +301,7 @@ int main(int argc, char **argv) try {
         CMDARGS_OPTION_ADD(threads, std::size_t
             ,"the number of working threads, by default - all avail threads be used"
             ,optional, default_<std::size_t>(std::thread::hardware_concurrency()));
-        CMDARGS_OPTION_ADD(max_size, std::size_t, "the maximum size of input lines"
+        CMDARGS_OPTION_ADD(max_size, std::size_t, "the maximum length of input lines"
             ,optional, default_<std::size_t>(1024u));
         CMDARGS_OPTION_ADD(sessions_n, std::size_t, "the number of initialy preallocated sessions"
             ,optional, default_<std::size_t>(1024u));

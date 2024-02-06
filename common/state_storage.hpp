@@ -68,13 +68,13 @@ private:
     }
     template<typename Iter>
     auto get_next_impl(Iter it) {
-        it = std::next(it);
-        if ( it != m_map.end() ) {
-            auto buf = it->key_val;
-            return std::make_tuple(false, it, std::move(buf));
+        auto new_it = std::next(it);
+        if ( new_it != m_map.end() ) {
+            auto buf = new_it->key_val;
+            return std::make_tuple(false, std::move(new_it), std::move(buf));
         }
 
-        return std::make_tuple(true, it, shared_buffer{});
+        return std::make_tuple(true, std::move(it), shared_buffer{});
     }
 
 public:
@@ -84,7 +84,7 @@ public:
     }
 
     template<typename Iter>
-    auto get_next(Iter &it) {
+    auto get_next(Iter it) {
         auto fut = ba::post(m_strand, ba::use_future([this, it](){ return get_next_impl(it); }));
         return fut.get();
     }

@@ -15,8 +15,8 @@
 #define __shared_state_server__intrusive_base_hpp__included
 
 #include <atomic>
-#include <array>
-#include <type_traits>
+#include <utility>
+#include <cstdint>
 
 template<typename T>
 struct intrusive_ptr;
@@ -41,6 +41,7 @@ struct user_delete: deleter_holder<T> {
         :m_del{std::move(del)}
     {}
     void delete_(T *p) const override { m_del(p); }
+
 private:
     Deleter m_del;
 };
@@ -50,10 +51,10 @@ struct intrusive_base_base {
     friend struct intrusive_ptr;
 
     intrusive_base_base() noexcept
-        :m_counter{0u}
+        :m_counter{1u}
     {}
     intrusive_base_base(const intrusive_base_base &) noexcept
-        :m_counter{0u}
+        :m_counter{1u}
     {}
 
     void intrusive_increment_ref() noexcept
@@ -99,15 +100,15 @@ protected:
 
 private:
     template<typename Deleter>
-    void intrusive_set_deleter(Deleter del) {
-        static_assert(std::tuple_size<decltype(m_arr)>::value >= sizeof(Deleter));
-        m_del = ::new(m_arr.data()) Deleter{std::move(del)};
+    void intrusive_set_deleter(Deleter del) noexcept {
+        static_assert(sizeof(m_arr) >= sizeof(Deleter));
+        m_del = ::new(std::addressof(m_arr)) Deleter{std::move(del)};
     }
     virtual void intrusive_call_deleter(void *p) override
     { m_del->delete_(static_cast<Derived *>(p)); }
 
 private:
-    std::array<char, DeleterBytes> m_arr;
+    typename std::aligned_storage<DeleterBytes>::type m_arr;
     details::deleter_holder<Derived> *m_del;
 };
 

@@ -14,6 +14,8 @@
 #ifndef __shared_state_server__object_pool_hpp__included
 #define __shared_state_server__object_pool_hpp__included
 
+#include "intrusive_ptr.hpp"
+
 #include <boost/lockfree/stack.hpp>
 
 #include <atomic>
@@ -36,7 +38,8 @@ struct object_pool final {
     { assert(m_in_use == 0); }
 
     template<typename ...Args>
-    auto get(Args && ...args) { return get_impl(std::forward<Args>(args)...); }
+    auto get(Args && ...args)
+    { return get_impl(std::forward<Args>(args)...); }
 
     template<typename Deleter, typename ...Args>
     auto get_del(Deleter del, Args && ...args)
@@ -48,7 +51,9 @@ struct object_pool final {
 private:
     template<typename ...Args>
     auto get_impl(Args && ...args) {
-        static const auto deleter = [this](T *p) {
+        auto deleter = [this](T *p) {
+            p->~T();
+
             while ( !m_stack.push(p) )
             {}
 
@@ -75,7 +80,7 @@ private:
 
     template<typename Deleter, typename ...Args>
     auto get_impl_del(Deleter del, Args && ...args) {
-        static const auto deleter = [this, del=std::move(del)](T *p) {
+        auto deleter = [this, del=std::move(del)](T *p) {
             del(p);
 
             while ( !m_stack.push(p) )

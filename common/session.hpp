@@ -20,36 +20,40 @@
 #include "object_pool.hpp"
 #include "string_buffer.hpp"
 
+#include <boost/asio/bind_allocator.hpp>
 #include <boost/intrusive/list_hook.hpp>
 
 /**********************************************************************************************************************/
 
-struct session;
-using holder_ptr = intrusive_ptr<session>;
-
 struct session: boost::intrusive::list_base_hook<>, intrusive_base<session> {
+    using session_ptr = intrusive_ptr<session>;
+
     session(tcp::socket sock, std::size_t max_size, std::size_t inactivity_time, buffers_pool &pool)
         :m_sock{std::move(sock)}
+        ,m_inactivity_timer{m_sock.get_executor(), std::chrono::milliseconds{m_inactivity_time}}
         ,m_on_stop{false}
         ,m_max_size{max_size}
         ,m_inactivity_time{inactivity_time}
-        ,m_inactivity_timer{m_sock.get_executor(), std::chrono::milliseconds{m_inactivity_time}}
         ,m_pool{pool}
     { m_sock.set_option(tcp::no_delay{true}); }
+    virtual ~session() = default;
 
     // may be called from any thread
     // ReadedCB's signature: bool(shared_buf, holder_ptr)
     // ErrorCB's signature: void(error_handler_info)
     template<typename ReadedCB, typename ErrorCB>
-    void start(ReadedCB readed_cb, ErrorCB error_cb, holder_ptr holder = {}) {
+    void start(ReadedCB readed_cb, ErrorCB error_cb, session_ptr holder = {}) {
+        auto lambda = [this, readed_cb=std::move(readed_cb)
+            ,error_cb=std::move(error_cb), holder=std::move(holder)]
+        () mutable
+        { start_impl(std::move(readed_cb), std::move(error_cb), make_buffer(m_pool), std::move(holder)); };
+
         ba::post(
              m_sock.get_executor()
-            ,[this, readed_cb=std::move(readed_cb)
-                ,error_cb=std::move(error_cb), holder=std::move(holder)]
-            () mutable
-            { start_impl(readed_cb, error_cb, make_buffer(m_pool), std::move(holder)); }
+            ,std::move(lambda)
         );
     }
+
     auto stop() {
         return ba::post(
              m_sock.get_executor()
@@ -61,48 +65,15 @@ struct session: boost::intrusive::list_base_hook<>, intrusive_base<session> {
     // SentCB's signature: void(bool) - true, if the message was sent successfully
     // ErrorCB's signature: void(error_handler_info)
     template<typename SentCB, typename ErrorCB>
-    void send(SentCB sent_cb, ErrorCB error_cb, shared_buffer msg, bool disconnect, holder_ptr holder) {
+    void send(SentCB sent_cb, ErrorCB error_cb, shared_buffer msg, bool disconnect, session_ptr holder) {
+        auto lambda = [this, sent_cb=std::move(sent_cb), error_cb=std::move(error_cb)
+            ,msg=std::move(msg), disconnect, holder=std::move(holder)]
+        () mutable
+        { send_impl(std::move(sent_cb), std::move(error_cb), std::move(msg), disconnect, std::move(holder)); };
+
         ba::post(
              m_sock.get_executor()
-            ,[this, sent_cb=std::move(sent_cb), error_cb=std::move(error_cb)
-                , msg=std::move(msg), disconnect, holder=std::move(holder)]
-             () mutable
-             { send_impl(std::move(sent_cb), std::move(error_cb), std::move(msg), disconnect, std::move(holder)); }
-        );
-    }
-    template<typename SentCB, typename ErrorCB>
-    void send_impl(SentCB sent_cb, ErrorCB error_cb, shared_buffer msg, bool disconnect, holder_ptr holder) {
-        auto *str = msg.get();
-        ba::async_write(
-             m_sock
-            ,ba::buffer(str->string())
-            ,[this, sent_cb=std::move(sent_cb), error_cb=std::move(error_cb)
-                ,msg=std::move(msg), disconnect, holder=std::move(holder)]
-            (const bs::error_code &ec, std::size_t) mutable {
-                if ( !m_on_stop && ec ) {
-                    CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO("session", ec));
-
-                    sent_cb(false);
-
-                    return;
-                }
-
-                sent_cb(true);
-
-                if ( disconnect ) {
-                    stop();
-                }
-            }
-        );
-    }
-
-    template</*typename OnSentCB, */typename ErrorCB>
-    auto send_stop(/*OnSentCB on_sent_cb,*/ const ErrorCB &error_cb, holder_ptr holder) {
-        return send(
-             std::move(error_cb)
-            ,make_buffer(m_pool, "STOP \n")
-            ,true
-            ,std::move(holder)
+            ,std::move(lambda)
         );
     }
 
@@ -110,6 +81,34 @@ struct session: boost::intrusive::list_base_hook<>, intrusive_base<session> {
     auto endpoint() const { return m_sock.remote_endpoint(); }
 
 private:
+    template<typename SentCB, typename ErrorCB>
+    void send_impl(SentCB sent_cb, ErrorCB error_cb, shared_buffer msg, bool disconnect, session_ptr holder) {
+        auto *str = msg.get();
+        auto lambda = [this, sent_cb=std::move(sent_cb), error_cb=std::move(error_cb)
+            ,msg=std::move(msg), disconnect, holder=std::move(holder)]
+        (const bs::error_code &ec, std::size_t) mutable {
+            if ( !m_on_stop && ec ) {
+                CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO("session", ec));
+
+                sent_cb(false);
+
+                return;
+            }
+
+            sent_cb(true);
+
+            if ( disconnect ) {
+                stop();
+            }
+        };
+
+        ba::async_write(
+             m_sock
+            ,ba::buffer(str->string())
+            ,std::move(lambda)
+        );
+    }
+
     void stop_impl() {
         if ( m_on_stop ) { return; }
 
@@ -122,7 +121,7 @@ private:
         m_inactivity_timer.cancel(ec);
     }
 
-    void start_inactivity_timer(holder_ptr holder) {
+    void start_inactivity_timer(session_ptr holder) {
         m_inactivity_timer.async_wait(
             [this, holder=std::move(holder)]
             (bs::error_code ec) mutable
@@ -136,22 +135,24 @@ private:
     }
 
     template<typename ReadedCB, typename ErrorCB>
-    void start_impl(ReadedCB readed_cb, ErrorCB error_cb, shared_buffer buf, holder_ptr holder) {
+    void start_impl(ReadedCB readed_cb, ErrorCB error_cb, shared_buffer buf, session_ptr holder) {
         if ( m_inactivity_time ) { start_inactivity_timer(holder); }
 
         start_read(std::move(readed_cb), std::move(error_cb), std::move(buf), std::move(holder));
     }
     template<typename ReadedCB, typename ErrorCB>
-    void start_read(ReadedCB readed_cb, ErrorCB error_cb, shared_buffer buf, holder_ptr holder) {
+    void start_read(ReadedCB readed_cb, ErrorCB error_cb, shared_buffer buf, session_ptr holder) {
         auto *ptr = buf.get();
+        auto lambda = [this, readed_cb=std::move(readed_cb), error_cb=std::move(error_cb)
+            ,buf=std::move(buf), holder=std::move(holder)]
+        (const bs::error_code& ec, std::size_t rd) mutable
+        { on_readed(std::move(readed_cb), std::move(error_cb), std::move(buf), ec, rd, std::move(holder)); };
+
         ba::async_read_until(
              m_sock
-            ,ba::dynamic_buffer(ptr->string())
+            ,ba::dynamic_buffer(ptr->string(), m_max_size)
             ,'\n'
-            ,[this, readed_cb=std::move(readed_cb), error_cb=std::move(error_cb)
-                ,buf=std::move(buf), holder=std::move(holder)]
-             (const bs::error_code& ec, std::size_t rd) mutable
-             { on_readed(std::move(readed_cb), std::move(error_cb), std::move(buf), ec, rd, std::move(holder)); }
+            ,std::move(lambda)
         );
     }
     template<typename ReadedCB, typename ErrorCB>
@@ -161,7 +162,7 @@ private:
         ,shared_buffer buf
         ,bs::error_code ec
         ,std::size_t rd
-        ,holder_ptr holder)
+        ,session_ptr holder)
     {
         if ( !m_on_stop && ec ) {
             CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO("session", ec));
@@ -190,34 +191,12 @@ private:
         }
     }
 
-    // template</*typename OnSentCB,*/ typename ErrorCB>
-    // auto send_impl(/*OnSentCB on_sent_cb,*/ const ErrorCB &error_cb, shared_buffer msg, bool disconnect, holder_ptr holder) {
-    //     //std::cout << "send_impl(string): " << *msg << std::endl;
-
-    //     return fut;
-    // }
-    // template<typename OnSentCB, typename ErrorCB>
-    // void sent(OnSentCB on_sent_cb, ErrorCB error_cb, bool disconnect, const bs::error_code &ec) {
-    //     if ( !m_on_stop && ec ) {
-    //         CALL_ERROR_HANDLER(error_cb, MAKE_ERROR_INFO("session", ec));
-
-    //         on_sent_cb(false);
-
-    //         return;
-    //     }
-    //     on_sent_cb(true);
-
-    //     if ( disconnect ) {
-    //         stop();
-    //     }
-    // }
-
 private:
     tcp::socket m_sock;
+    ba::steady_timer m_inactivity_timer;
     bool m_on_stop;
     std::size_t m_max_size;
     std::size_t m_inactivity_time;
-    ba::steady_timer m_inactivity_timer;
     buffers_pool &m_pool;
 };
 
