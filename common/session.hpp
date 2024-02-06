@@ -20,7 +20,6 @@
 #include "object_pool.hpp"
 #include "string_buffer.hpp"
 
-#include <boost/asio/bind_allocator.hpp>
 #include <boost/intrusive/list_hook.hpp>
 
 /**********************************************************************************************************************/
