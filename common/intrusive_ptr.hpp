@@ -109,12 +109,12 @@ public:
 };
 
 template<typename T, typename ...Args>
-auto make_intrusive(Args && ...args) noexcept {
+auto make_intrusive(Args && ...args) {
     return intrusive_ptr<T>{::new T(std::forward<Args>(args)...)};
 }
 
 template<typename T, typename Deleter, typename ...Args>
-auto make_intrusive_del(Deleter &&del, Args && ...args) noexcept {
+auto make_intrusive_del(Deleter &&del, Args && ...args) {
     return intrusive_ptr<T>{::new T(std::forward<Args>(args)...), std::forward<Deleter>(del)};
 }
 
